@@ -1,0 +1,26 @@
+# Sample configuration for synology-file-cache
+
+synology:
+  base_url: "https://nas.local:5001"
+  username: "admin"
+  password: "password"
+  skip_tls_verify: false
+
+cache:
+  root_dir: "./cache-data"
+  max_size_gb: 50
+  max_disk_usage_percent: 50
+  recent_modified_days: 30
+  recent_accessed_days: 30
+
+sync:
+  full_scan_interval: "1h"
+  incremental_interval: "1m"
+  prefetch_interval: "30s"
+
+http:
+  bind_addr: "0.0.0.0:8080"
+
+logging:
+  level: "info" # debug, info, warn, error
+  format: "json" # json or text
