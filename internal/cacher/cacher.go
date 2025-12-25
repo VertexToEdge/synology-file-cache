@@ -19,6 +19,7 @@ type Config struct {
 	MaxDiskUsagePercent float64 // Maximum disk usage percentage
 	PrefetchInterval    time.Duration
 	BatchSize           int // Number of files to process per batch
+	ConcurrentDownloads int // Number of parallel downloads
 }
 
 // Cacher handles file caching and eviction
@@ -107,48 +108,89 @@ func (c *Cacher) runCacheLoop(ctx context.Context) {
 		return
 	}
 
-	c.logger.Info("caching files", zap.Int("count", len(files)))
+	c.logger.Info("caching files",
+		zap.Int("count", len(files)),
+		zap.Int("workers", c.config.ConcurrentDownloads))
 
+	// Create worker pool
+	fileChan := make(chan *store.File, len(files))
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < c.config.ConcurrentDownloads; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			c.cacheWorker(ctx, workerID, fileChan)
+		}(i)
+	}
+
+	// Send files to workers
 	for _, file := range files {
 		select {
 		case <-ctx.Done():
+			close(fileChan)
+			wg.Wait()
 			return
-		default:
+		case fileChan <- file:
 		}
+	}
 
-		// Check space before caching each file
-		hasSpace, availableBytes, err := c.checkSpaceForFile(file.Size)
-		if err != nil {
-			c.logger.Error("failed to check disk space", zap.Error(err))
-			continue
-		}
+	// Close channel and wait for all workers to finish
+	close(fileChan)
+	wg.Wait()
+}
 
-		if !hasSpace {
-			// Try to evict files to make space (with rate limiting)
-			if err := c.tryEvict(ctx, file.Size); err != nil {
-				c.logger.Warn("eviction failed or rate-limited, skipping file",
-					zap.String("path", file.Path),
-					zap.Int64("size", file.Size),
-					zap.Int64("available", availableBytes),
+// cacheWorker processes files from the file channel
+func (c *Cacher) cacheWorker(ctx context.Context, workerID int, fileChan <-chan *store.File) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case file, ok := <-fileChan:
+			if !ok {
+				return // Channel closed
+			}
+
+			// Check space before caching each file
+			hasSpace, availableBytes, err := c.checkSpaceForFile(file.Size)
+			if err != nil {
+				c.logger.Error("failed to check disk space",
+					zap.Int("worker", workerID),
 					zap.Error(err))
 				continue
 			}
 
-			// Re-check space after eviction
-			hasSpace, _, err = c.checkSpaceForFile(file.Size)
-			if err != nil || !hasSpace {
-				c.logger.Warn("still not enough space after eviction, skipping file",
+			if !hasSpace {
+				// Try to evict files to make space (with rate limiting)
+				if err := c.tryEvict(ctx, file.Size); err != nil {
+					c.logger.Warn("eviction failed or rate-limited, skipping file",
+						zap.Int("worker", workerID),
+						zap.String("path", file.Path),
+						zap.Int64("size", file.Size),
+						zap.Int64("available", availableBytes),
+						zap.Error(err))
+					continue
+				}
+
+				// Re-check space after eviction
+				hasSpace, _, err = c.checkSpaceForFile(file.Size)
+				if err != nil || !hasSpace {
+					c.logger.Warn("still not enough space after eviction, skipping file",
+						zap.Int("worker", workerID),
+						zap.String("path", file.Path),
+						zap.Int64("size", file.Size))
+					continue
+				}
+			}
+
+			if err := c.cacheFile(ctx, file); err != nil {
+				c.logger.Error("failed to cache file",
+					zap.Int("worker", workerID),
 					zap.String("path", file.Path),
-					zap.Int64("size", file.Size))
+					zap.Error(err))
 				continue
 			}
-		}
-
-		if err := c.cacheFile(ctx, file); err != nil {
-			c.logger.Error("failed to cache file",
-				zap.String("path", file.Path),
-				zap.Error(err))
-			continue
 		}
 	}
 }

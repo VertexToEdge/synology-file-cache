@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // Manager handles local filesystem operations
@@ -32,30 +31,14 @@ func (m *Manager) RootDir() string {
 
 // DiskUsage represents disk usage statistics
 type DiskUsage struct {
-	Total     uint64  // Total disk space in bytes
-	Used      uint64  // Used disk space in bytes
-	Free      uint64  // Free disk space in bytes
-	UsedPct   float64 // Used percentage (0-100)
+	Total   uint64  // Total disk space in bytes
+	Used    uint64  // Used disk space in bytes
+	Free    uint64  // Free disk space in bytes
+	UsedPct float64 // Used percentage (0-100)
 }
 
 // GetDiskUsage returns disk usage for the cache directory
-func (m *Manager) GetDiskUsage() (*DiskUsage, error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(m.rootDir, &stat); err != nil {
-		return nil, fmt.Errorf("failed to get disk stats: %w", err)
-	}
-
-	total := stat.Blocks * uint64(stat.Bsize)
-	free := stat.Bavail * uint64(stat.Bsize)
-	used := total - free
-
-	return &DiskUsage{
-		Total:   total,
-		Used:    used,
-		Free:    free,
-		UsedPct: float64(used) / float64(total) * 100,
-	}, nil
-}
+// Platform-specific implementation in fs_unix.go and fs_windows.go
 
 // GetCacheSize returns total size of cached files
 func (m *Manager) GetCacheSize() (int64, error) {

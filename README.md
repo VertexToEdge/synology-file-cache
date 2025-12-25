@@ -265,6 +265,10 @@ drive.example.com {
 
 ### 📋 TODO
 
+- [ ] HTTP Range 요청 기반 이어받기 (Resume) 기능
+  - 다운로드 중단 시 이어서 받기 지원
+  - 임시 파일 크기 확인 및 Range 헤더 사용
+  - 대용량 파일 다운로드 안정성 향상
 - [ ] 메트릭 수집 및 노출 (Prometheus)
 - [ ] Docker 이미지 빌드
 - [ ] 통합 테스트 작성

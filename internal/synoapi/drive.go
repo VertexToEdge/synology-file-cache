@@ -280,7 +280,8 @@ func (c *Client) DriveDownloadFile(fileID int64, path string) (io.ReadCloser, st
 
 	urlStr := c.buildURL(apiPath, params)
 
-	resp, err := c.doRequest("GET", urlStr, nil)
+	// Use download client with longer timeout for file downloads
+	resp, err := c.doDownloadRequest("GET", urlStr, nil)
 	if err != nil {
 		return nil, "", 0, err
 	}

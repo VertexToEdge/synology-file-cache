@@ -31,6 +31,7 @@ type CacheConfig struct {
 	MaxDiskUsagePercent   int    `mapstructure:"max_disk_usage_percent"`
 	RecentModifiedDays    int    `mapstructure:"recent_modified_days"`
 	RecentAccessedDays    int    `mapstructure:"recent_accessed_days"`
+	ConcurrentDownloads   int    `mapstructure:"concurrent_downloads"`
 }
 
 // SyncConfig contains synchronization settings
@@ -43,7 +44,8 @@ type SyncConfig struct {
 
 // HTTPConfig contains HTTP server configuration
 type HTTPConfig struct {
-	BindAddr string `mapstructure:"bind_addr"`
+	BindAddr           string `mapstructure:"bind_addr"`
+	EnableAdminBrowser bool   `mapstructure:"enable_admin_browser"`
 }
 
 // LoggingConfig contains logging settings
@@ -64,10 +66,12 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("cache.max_disk_usage_percent", 50)
 	viper.SetDefault("cache.recent_modified_days", 30)
 	viper.SetDefault("cache.recent_accessed_days", 30)
+	viper.SetDefault("cache.concurrent_downloads", 3)
 	viper.SetDefault("sync.full_scan_interval", "1h")
 	viper.SetDefault("sync.incremental_interval", "1m")
 	viper.SetDefault("sync.prefetch_interval", "30s")
 	viper.SetDefault("http.bind_addr", "0.0.0.0:8080")
+	viper.SetDefault("http.enable_admin_browser", false)
 	viper.SetDefault("logging.level", "info")
 	viper.SetDefault("logging.format", "json")
 
@@ -108,6 +112,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Cache.MaxDiskUsagePercent <= 0 || c.Cache.MaxDiskUsagePercent > 100 {
 		return fmt.Errorf("cache.max_disk_usage_percent must be between 1 and 100")
+	}
+	if c.Cache.ConcurrentDownloads < 1 || c.Cache.ConcurrentDownloads > 10 {
+		return fmt.Errorf("cache.concurrent_downloads must be between 1 and 10")
 	}
 
 	// Validate sync intervals

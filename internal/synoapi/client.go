@@ -14,14 +14,15 @@ import (
 
 // Client is a Synology File Station API client
 type Client struct {
-	baseURL       string
-	username      string
-	password      string
-	httpClient    *http.Client
-	sid           string
-	sidMu         sync.RWMutex
-	apiInfo       map[string]APIEndpoint
-	apiInfoMu     sync.RWMutex
+	baseURL          string
+	username         string
+	password         string
+	httpClient       *http.Client
+	downloadClient   *http.Client // Separate client for file downloads with longer timeout
+	sid              string
+	sidMu            sync.RWMutex
+	apiInfo          map[string]APIEndpoint
+	apiInfoMu        sync.RWMutex
 }
 
 // APIEndpoint contains API path and version information
@@ -114,6 +115,13 @@ func NewClient(baseURL, username, password string, skipTLSVerify bool) *Client {
 		},
 	}
 
+	// Create a separate transport for downloads to avoid sharing connections
+	downloadTransport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: skipTLSVerify,
+		},
+	}
+
 	return &Client{
 		baseURL:  strings.TrimSuffix(baseURL, "/"),
 		username: username,
@@ -121,6 +129,10 @@ func NewClient(baseURL, username, password string, skipTLSVerify bool) *Client {
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   30 * time.Second,
+		},
+		downloadClient: &http.Client{
+			Transport: downloadTransport,
+			Timeout:   0, // No timeout for file downloads - rely on context cancellation
 		},
 		apiInfo: make(map[string]APIEndpoint),
 	}
@@ -205,6 +217,25 @@ func (c *Client) doRequest(method, urlStr string, body io.Reader) (*http.Respons
 	}
 
 	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	return resp, nil
+}
+
+// doDownloadRequest performs an HTTP request for file downloads with longer timeout
+func (c *Client) doDownloadRequest(method, urlStr string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, urlStr, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+
+	resp, err := c.downloadClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}

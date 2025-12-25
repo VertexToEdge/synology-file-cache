@@ -29,17 +29,25 @@ type sessionEntry struct {
 
 // Server represents the HTTP API server
 type Server struct {
-	store    *store.Store
-	server   *http.Server
-	sessions map[string]sessionEntry // session ID -> session entry
-	sessLock sync.RWMutex
+	store              *store.Store
+	server             *http.Server
+	sessions           map[string]sessionEntry // session ID -> session entry
+	sessLock           sync.RWMutex
+	adminUsername      string
+	adminPassword      string
+	enableAdminBrowser bool
+	cacheRootDir       string
 }
 
 // NewServer creates a new HTTP API server
-func NewServer(bindAddr string, store *store.Store) *Server {
+func NewServer(bindAddr string, store *store.Store, adminUsername, adminPassword string, enableAdminBrowser bool, cacheRootDir string) *Server {
 	s := &Server{
-		store:    store,
-		sessions: make(map[string]sessionEntry),
+		store:              store,
+		sessions:           make(map[string]sessionEntry),
+		adminUsername:      adminUsername,
+		adminPassword:      adminPassword,
+		enableAdminBrowser: enableAdminBrowser,
+		cacheRootDir:       cacheRootDir,
 	}
 
 	mux := http.NewServeMux()
@@ -50,6 +58,13 @@ func NewServer(bindAddr string, store *store.Store) *Server {
 	// File download endpoints (by share token)
 	mux.HandleFunc("/f/", s.handleFileDownload)       // Cache server format: /f/{token}
 	mux.HandleFunc("/d/s/", s.handleSynologyDownload) // Synology Drive format: /d/s/{token}/{extra}
+
+	// Admin file browser endpoints (requires basic auth)
+	if enableAdminBrowser {
+		mux.HandleFunc("/admin/browse", s.withAdminAuth(s.handleAdminBrowse))
+		mux.HandleFunc("/admin/browse/", s.withAdminAuth(s.handleAdminBrowse))
+		mux.HandleFunc("/admin/logout", s.handleAdminLogout)
+	}
 
 	// Debug endpoints
 	mux.HandleFunc("/debug/files", s.handleDebugFiles)
@@ -409,4 +424,369 @@ func (s *Server) cleanExpiredSessions() {
 			delete(s.sessions, id)
 		}
 	}
+}
+
+// withAdminAuth wraps a handler with HTTP Basic Auth middleware
+func (s *Server) withAdminAuth(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Admin Access"`)
+			http.Error(w, "Authentication required", http.StatusUnauthorized)
+			return
+		}
+
+		// Use constant-time comparison to prevent timing attacks
+		validUsername := subtle.ConstantTimeCompare([]byte(username), []byte(s.adminUsername)) == 1
+		validPassword := subtle.ConstantTimeCompare([]byte(password), []byte(s.adminPassword)) == 1
+
+		if !validUsername || !validPassword {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Admin Access"`)
+			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+			logger.Log.Warnw("Failed admin authentication attempt",
+				"username", username,
+				"remote_addr", r.RemoteAddr,
+			)
+			return
+		}
+
+		handler(w, r)
+	}
+}
+
+// handleAdminBrowse handles file browser requests for admin
+func (s *Server) handleAdminBrowse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract path from URL
+	requestPath := strings.TrimPrefix(r.URL.Path, "/admin/browse")
+	requestPath = strings.TrimPrefix(requestPath, "/")
+
+	logger.Log.Debugw("Admin browse request", "path", requestPath)
+
+	// Build full filesystem path
+	fullPath := filepath.Join(s.cacheRootDir, requestPath)
+
+	// Security check: prevent directory traversal
+	if !strings.HasPrefix(filepath.Clean(fullPath), filepath.Clean(s.cacheRootDir)) {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+
+	// Check if path exists
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Path not found", http.StatusNotFound)
+		} else {
+			logger.Log.Errorw("Failed to stat path", "path", fullPath, "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// If it's a file, serve it directly
+	if !info.IsDir() {
+		s.serveFile(w, r, fullPath)
+		return
+	}
+
+	// Read directory contents
+	entries, err := os.ReadDir(fullPath)
+	if err != nil {
+		logger.Log.Errorw("Failed to read directory", "path", fullPath, "error", err)
+		http.Error(w, "Failed to read directory", http.StatusInternalServerError)
+		return
+	}
+
+	// Build file entry list
+	type FileEntry struct {
+		Name                string
+		Size                int64
+		ModTime             time.Time
+		IsDir               bool
+		AccessedAt          *time.Time
+		CreatedAt           *time.Time
+		LastAccessInCacheAt *time.Time
+	}
+
+	var fileEntries []FileEntry
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		fileEntry := FileEntry{
+			Name:    entry.Name(),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+			IsDir:   entry.IsDir(),
+		}
+
+		// If it's a file, try to get metadata from DB
+		if !entry.IsDir() {
+			filePath := filepath.Join(requestPath, entry.Name())
+			if dbFile, err := s.store.GetFileByPath(filePath); err == nil && dbFile != nil {
+				fileEntry.AccessedAt = dbFile.AccessedAt
+				fileEntry.CreatedAt = &dbFile.CreatedAt
+				fileEntry.LastAccessInCacheAt = dbFile.LastAccessInCacheAt
+			}
+		}
+
+		fileEntries = append(fileEntries, fileEntry)
+	}
+
+	// Sort: directories first, then alphabetically
+	for i := 0; i < len(fileEntries); i++ {
+		for j := i + 1; j < len(fileEntries); j++ {
+			iIsDir := fileEntries[i].IsDir
+			jIsDir := fileEntries[j].IsDir
+			iName := strings.ToLower(fileEntries[i].Name)
+			jName := strings.ToLower(fileEntries[j].Name)
+			if (!iIsDir && jIsDir) || (iIsDir == jIsDir && iName > jName) {
+				fileEntries[i], fileEntries[j] = fileEntries[j], fileEntries[i]
+			}
+		}
+	}
+
+	// Render HTML
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Build breadcrumb navigation
+	var breadcrumb string
+	if requestPath == "" {
+		breadcrumb = `<a href="/admin/browse">📁 /</a>`
+	} else {
+		breadcrumb = `<a href="/admin/browse">📁</a> / `
+		// Always use "/" for URL paths, regardless of OS
+		parts := strings.Split(strings.ReplaceAll(requestPath, string(filepath.Separator), "/"), "/")
+		currentPath := ""
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			if currentPath != "" {
+				currentPath += "/"
+			}
+			currentPath += part
+
+			// All parts are clickable
+			breadcrumb += `<a href="/admin/browse/` + currentPath + `">` + part + `</a> / `
+		}
+		// Remove trailing " / "
+		if len(breadcrumb) > 3 {
+			breadcrumb = breadcrumb[:len(breadcrumb)-3]
+		}
+	}
+
+	displayPath := "/" + requestPath
+	if displayPath == "//" {
+		displayPath = "/"
+	}
+
+	html := `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Browser - ` + displayPath + `</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; }
+        .breadcrumb { margin: 0; font-size: 24px; font-weight: normal; }
+        .breadcrumb a { color: #0066cc; text-decoration: none; }
+        .breadcrumb a:hover { text-decoration: underline; }
+        .logout-btn {
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 14px;
+        }
+        .logout-btn:hover { background-color: #c82333; }
+        table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+        th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #ddd; }
+        th { background-color: #f0f0f0; font-weight: bold; }
+        tr:hover { background-color: #f9f9f9; }
+        a { color: #0066cc; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .size { text-align: right; }
+        .parent { font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1 class="breadcrumb">` + breadcrumb + `</h1>
+        <a href="/admin/logout" class="logout-btn">Logout</a>
+    </div>
+    <table>
+`
+
+	// Add parent directory link
+	if requestPath != "" {
+		parentPath := filepath.Dir(requestPath)
+		if parentPath == "." {
+			parentPath = ""
+		}
+		html += `        <tr class="parent">
+            <td colspan="6"><a href="/admin/browse/` + parentPath + `">📁 ..</a></td>
+        </tr>
+`
+	}
+
+	html += `        <tr>
+            <th>Name</th>
+            <th>Size</th>
+            <th>Modified</th>
+            <th>Accessed</th>
+            <th>Cached At</th>
+            <th>Last Served</th>
+        </tr>
+`
+
+	for _, entry := range fileEntries {
+		icon := "📄"
+		targetPath := filepath.Join(requestPath, entry.Name)
+		link := "/admin/browse/" + targetPath
+
+		sizeStr := "-"
+		if !entry.IsDir {
+			sizeStr = formatSize(entry.Size)
+		} else {
+			icon = "📁"
+		}
+
+		modTimeStr := entry.ModTime.Format("2006-01-02 15:04:05")
+
+		accessedStr := "-"
+		if entry.AccessedAt != nil {
+			accessedStr = entry.AccessedAt.Format("2006-01-02 15:04:05")
+		}
+
+		createdStr := "-"
+		if entry.CreatedAt != nil {
+			createdStr = entry.CreatedAt.Format("2006-01-02 15:04:05")
+		}
+
+		lastServedStr := "-"
+		if entry.LastAccessInCacheAt != nil {
+			lastServedStr = entry.LastAccessInCacheAt.Format("2006-01-02 15:04:05")
+		}
+
+		html += `        <tr>
+            <td><a href="` + link + `">` + icon + ` ` + entry.Name + `</a></td>
+            <td class="size">` + sizeStr + `</td>
+            <td>` + modTimeStr + `</td>
+            <td>` + accessedStr + `</td>
+            <td>` + createdStr + `</td>
+            <td>` + lastServedStr + `</td>
+        </tr>
+`
+	}
+
+	html += `    </table>
+</body>
+</html>`
+
+	w.Write([]byte(html))
+}
+
+// serveFile serves a file from the filesystem
+func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, fullPath string) {
+	// Open file
+	f, err := os.Open(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "File not found", http.StatusNotFound)
+		} else {
+			logger.Log.Errorw("Failed to open file", "path", fullPath, "error", err)
+			http.Error(w, "File not available", http.StatusInternalServerError)
+		}
+		return
+	}
+	defer f.Close()
+
+	// Get file info
+	stat, err := f.Stat()
+	if err != nil {
+		logger.Log.Errorw("Failed to stat file", "path", fullPath, "error", err)
+		http.Error(w, "File not available", http.StatusInternalServerError)
+		return
+	}
+
+	// Don't serve directories
+	if stat.IsDir() {
+		http.Error(w, "Cannot download directory", http.StatusBadRequest)
+		return
+	}
+
+	// Determine content type
+	filename := filepath.Base(fullPath)
+	contentType := mime.TypeByExtension(filepath.Ext(filename))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	// Set headers
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filename))
+
+	// Stream file
+	if _, err := io.Copy(w, f); err != nil {
+		logger.Log.Errorw("Failed to stream file", "path", fullPath, "error", err)
+		return
+	}
+
+	logger.Log.Infow("File served via admin access",
+		"path", fullPath,
+		"size", stat.Size())
+}
+
+// handleAdminLogout handles logout by returning 401 to clear browser credentials
+func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="Admin Access"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	html := `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Logged Out</title>
+    <style>
+        body { font-family: sans-serif; margin: 50px; text-align: center; }
+        h1 { color: #333; }
+        p { color: #666; margin-top: 20px; }
+        a { color: #0066cc; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>✓ Logged Out</h1>
+    <p>You have been successfully logged out.</p>
+    <p><a href="/admin/browse">Log in again</a></p>
+</body>
+</html>`
+	w.Write([]byte(html))
+}
+
+// formatSize formats file size in human-readable format
+func formatSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
 }

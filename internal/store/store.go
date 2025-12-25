@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/vertextoedge/synology-file-cache/internal/logger"
 )
 
@@ -23,7 +23,7 @@ func Open(dbPath string) (*Store, error) {
 	}
 
 	// Open database
-	db, err := sql.Open("sqlite3", dbPath+"?_journal=WAL&_timeout=5000")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}

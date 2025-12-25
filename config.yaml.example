@@ -12,6 +12,7 @@ cache:
   max_disk_usage_percent: 50
   recent_modified_days: 30
   recent_accessed_days: 30
+  concurrent_downloads: 3  # Number of files to download in parallel (1-10)
 
 sync:
   full_scan_interval: "1h"
@@ -21,6 +22,7 @@ sync:
 
 http:
   bind_addr: "0.0.0.0:8080"
+  enable_admin_browser: false  # Enable admin file browser with basic auth (uses synology username/password)
 
 logging:
   level: "info" # debug, info, warn, error

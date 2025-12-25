@@ -92,11 +92,19 @@ func main() {
 		MaxDiskUsagePercent: float64(cfg.Cache.MaxDiskUsagePercent),
 		PrefetchInterval:    cfg.Sync.GetPrefetchInterval(),
 		BatchSize:           10,
+		ConcurrentDownloads: cfg.Cache.ConcurrentDownloads,
 	}
 	cacherInstance := cacher.New(cacherCfg, synoClient, db, fsManager, zapLogger)
 
 	// Create HTTP server
-	httpServer := httpapi.NewServer(cfg.HTTP.BindAddr, db)
+	httpServer := httpapi.NewServer(
+		cfg.HTTP.BindAddr,
+		db,
+		cfg.Synology.Username,
+		cfg.Synology.Password,
+		cfg.HTTP.EnableAdminBrowser,
+		cfg.Cache.RootDir,
+	)
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
