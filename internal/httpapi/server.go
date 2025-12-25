@@ -2,6 +2,10 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,22 +14,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vertextoedge/synology-file-cache/internal/logger"
 	"github.com/vertextoedge/synology-file-cache/internal/store"
 )
 
+// sessionEntry represents an authenticated session for a share
+type sessionEntry struct {
+	token     string    // share token
+	expiresAt time.Time // session expiration
+}
+
 // Server represents the HTTP API server
 type Server struct {
-	store  *store.Store
-	server *http.Server
+	store    *store.Store
+	server   *http.Server
+	sessions map[string]sessionEntry // session ID -> session entry
+	sessLock sync.RWMutex
 }
 
 // NewServer creates a new HTTP API server
 func NewServer(bindAddr string, store *store.Store) *Server {
 	s := &Server{
-		store: store,
+		store:    store,
+		sessions: make(map[string]sessionEntry),
 	}
 
 	mux := http.NewServeMux()
@@ -188,6 +202,13 @@ func (s *Server) serveFileByToken(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
+	// Check if share requires password
+	if share.Password.Valid && share.Password.String != "" {
+		if !s.verifySharePassword(w, r, token, share.Password.String) {
+			return
+		}
+	}
+
 	// Check if file is cached
 	if !file.Cached || !file.CachePath.Valid {
 		http.Error(w, "File not cached", http.StatusServiceUnavailable)
@@ -291,4 +312,101 @@ func (s *Server) handleDebugStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
+}
+
+// verifySharePassword verifies the password for a password-protected share
+// Returns true if verified, false if not (and sends appropriate HTTP response)
+func (s *Server) verifySharePassword(w http.ResponseWriter, r *http.Request, shareToken, correctPassword string) bool {
+	// 1. Check session cookie first
+	if cookie, err := r.Cookie("share_session"); err == nil {
+		if s.validateSession(cookie.Value, shareToken) {
+			return true
+		}
+	}
+
+	// 2. Check HTTP Basic Auth
+	_, password, ok := r.BasicAuth()
+	if ok {
+		// Use constant-time comparison to prevent timing attacks
+		if subtle.ConstantTimeCompare([]byte(password), []byte(correctPassword)) == 1 {
+			// Create session for future requests
+			sessionID := s.createSession(shareToken)
+			s.setSessionCookie(w, sessionID)
+			return true
+		}
+		http.Error(w, "Invalid password", http.StatusForbidden)
+		return false
+	}
+
+	// 3. No credentials provided - request authentication
+	w.Header().Set("WWW-Authenticate", `Basic realm="Password Protected Share"`)
+	http.Error(w, "Password required", http.StatusUnauthorized)
+	return false
+}
+
+// createSession creates a new session for an authenticated share
+func (s *Server) createSession(shareToken string) string {
+	// Generate random session ID
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback to hash-based ID if random fails
+		hash := sha256.Sum256([]byte(shareToken + time.Now().String()))
+		bytes = hash[:]
+	}
+	sessionID := hex.EncodeToString(bytes)
+
+	s.sessLock.Lock()
+	defer s.sessLock.Unlock()
+
+	// Clean up expired sessions periodically
+	if len(s.sessions) > 1000 {
+		s.cleanExpiredSessions()
+	}
+
+	s.sessions[sessionID] = sessionEntry{
+		token:     shareToken,
+		expiresAt: time.Now().Add(24 * time.Hour), // Session valid for 24 hours
+	}
+
+	return sessionID
+}
+
+// validateSession checks if a session is valid for the given share token
+func (s *Server) validateSession(sessionID, shareToken string) bool {
+	s.sessLock.RLock()
+	defer s.sessLock.RUnlock()
+
+	session, exists := s.sessions[sessionID]
+	if !exists {
+		return false
+	}
+
+	if time.Now().After(session.expiresAt) {
+		return false
+	}
+
+	return session.token == shareToken
+}
+
+// setSessionCookie sets the session cookie in the response
+func (s *Server) setSessionCookie(w http.ResponseWriter, sessionID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "share_session",
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   86400, // 24 hours
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   false, // Set to true if using HTTPS
+	})
+}
+
+// cleanExpiredSessions removes expired sessions from the map
+func (s *Server) cleanExpiredSessions() {
+	now := time.Now()
+	for id, session := range s.sessions {
+		if now.After(session.expiresAt) {
+			delete(s.sessions, id)
+		}
+	}
 }

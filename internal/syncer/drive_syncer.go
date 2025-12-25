@@ -802,15 +802,14 @@ func (s *DriveSyncer) createShareRecord(fileID int64, synoFileID int64, token st
 	}
 
 	if existingShare != nil {
-		// Update sharing_link if missing
-		if existingShare.SharingLink == "" {
-			s.updateShareWithAdvanceSharing(existingShare, synoFileID)
-		}
+		// Always update share info (password, expiration, sharing_link may have changed)
+		s.updateShareWithAdvanceSharing(existingShare, synoFileID)
 		return
 	}
 
-	// Get advanced sharing info to get sharing_link and url
-	var sharingLink, fullURL string
+	// Get advanced sharing info to get sharing_link, url, password, and expiration
+	var sharingLink, fullURL, password string
+	var expiresAt *time.Time
 	advInfo, err := s.client.DriveGetAdvanceSharing(synoFileID, "")
 	if err != nil {
 		s.logger.Warn("failed to get advance sharing info",
@@ -819,6 +818,11 @@ func (s *DriveSyncer) createShareRecord(fileID int64, synoFileID int64, token st
 	} else {
 		sharingLink = advInfo.SharingLink
 		fullURL = advInfo.URL
+		password = advInfo.ProtectPassword
+		if advInfo.DueDate > 0 {
+			t := time.Unix(advInfo.DueDate, 0)
+			expiresAt = &t
+		}
 	}
 
 	// Create new share record
@@ -828,7 +832,12 @@ func (s *DriveSyncer) createShareRecord(fileID int64, synoFileID int64, token st
 		SharingLink: sharingLink,
 		URL:         fullURL,
 		FileID:      fileID,
+		ExpiresAt:   expiresAt,
 		Revoked:     false,
+	}
+	if password != "" {
+		newShare.Password.Valid = true
+		newShare.Password.String = password
 	}
 
 	if err := s.store.CreateShare(newShare); err != nil {
@@ -857,6 +866,23 @@ func (s *DriveSyncer) updateShareWithAdvanceSharing(share *store.Share, synoFile
 	share.SharingLink = advInfo.SharingLink
 	share.URL = advInfo.URL
 
+	// Update password
+	if advInfo.ProtectPassword != "" {
+		share.Password.Valid = true
+		share.Password.String = advInfo.ProtectPassword
+	} else {
+		share.Password.Valid = false
+		share.Password.String = ""
+	}
+
+	// Update expiration date
+	if advInfo.DueDate > 0 {
+		t := time.Unix(advInfo.DueDate, 0)
+		share.ExpiresAt = &t
+	} else {
+		share.ExpiresAt = nil
+	}
+
 	if err := s.store.UpdateShare(share); err != nil {
 		s.logger.Warn("failed to update share with sharing_link",
 			zap.String("token", share.Token),
@@ -866,7 +892,8 @@ func (s *DriveSyncer) updateShareWithAdvanceSharing(share *store.Share, synoFile
 
 	s.logger.Debug("share record updated with sharing_link",
 		zap.String("token", share.Token),
-		zap.String("sharing_link", advInfo.SharingLink))
+		zap.String("sharing_link", advInfo.SharingLink),
+		zap.Bool("has_password", advInfo.ProtectPassword != ""))
 }
 
 // ScanFolder recursively scans a folder for files
