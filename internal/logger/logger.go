@@ -76,6 +76,11 @@ func Sync() error {
 	return nil
 }
 
+// GetZapLogger returns the underlying zap.Logger
+func GetZapLogger() *zap.Logger {
+	return logger
+}
+
 // WithFields returns a logger with additional fields
 func WithFields(fields map[string]interface{}) *zap.SugaredLogger {
 	if Log == nil {

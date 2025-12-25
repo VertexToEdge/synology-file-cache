@@ -121,10 +121,22 @@ func (s *Store) Migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_shares_file_id ON shares(file_id)`,
 	}
 
+	// Run migrations
 	for _, migration := range migrations {
 		if _, err := s.db.Exec(migration); err != nil {
 			return fmt.Errorf("migration failed: %w\nSQL: %s", err, migration)
 		}
+	}
+
+	// Add new columns to shares table (safe ALTER TABLE - ignores if column exists)
+	alterMigrations := []string{
+		`ALTER TABLE shares ADD COLUMN sharing_link TEXT DEFAULT ''`,
+		`ALTER TABLE shares ADD COLUMN url TEXT DEFAULT ''`,
+	}
+
+	for _, migration := range alterMigrations {
+		// Ignore errors for ALTER TABLE as column may already exist
+		s.db.Exec(migration)
 	}
 
 	logger.Log.Info("Database migrations completed successfully")

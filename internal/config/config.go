@@ -35,9 +35,10 @@ type CacheConfig struct {
 
 // SyncConfig contains synchronization settings
 type SyncConfig struct {
-	FullScanInterval    string `mapstructure:"full_scan_interval"`
-	IncrementalInterval string `mapstructure:"incremental_interval"`
-	PrefetchInterval    string `mapstructure:"prefetch_interval"`
+	FullScanInterval    string   `mapstructure:"full_scan_interval"`
+	IncrementalInterval string   `mapstructure:"incremental_interval"`
+	PrefetchInterval    string   `mapstructure:"prefetch_interval"`
+	ExcludeLabels       []string `mapstructure:"exclude_labels"` // Labels to exclude from caching
 }
 
 // HTTPConfig contains HTTP server configuration

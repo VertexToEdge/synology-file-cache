@@ -1,9 +1,9 @@
 # Sample configuration for synology-file-cache
 
 synology:
-  base_url: "https://nas.local:5001"
-  username: "admin"
-  password: "password"
+  base_url: "https://your-nas.example.com"
+  username: "your_username"
+  password: "your_password"
   skip_tls_verify: false
 
 cache:
@@ -17,6 +17,7 @@ sync:
   full_scan_interval: "1h"
   incremental_interval: "1m"
   prefetch_interval: "30s"
+  exclude_labels: []  # Labels to exclude from caching, e.g. ["temp", "no-cache"]
 
 http:
   bind_addr: "0.0.0.0:8080"

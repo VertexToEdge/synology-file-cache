@@ -28,7 +28,9 @@ type File struct {
 type Share struct {
 	ID           int64
 	SynoShareID  string
-	Token        string
+	Token        string         // Token from permanent_link (e.g., 167e18n3x0hcXGDIrZV45Gp5uf66gpac)
+	SharingLink  string         // sharing_link from AdvanceSharing API (e.g., OXSIBppBv2Lxc0znhDKNs5k...)
+	URL          string         // Full URL from AdvanceSharing API
 	FileID       int64
 	Password     sql.NullString
 	ExpiresAt    *time.Time
@@ -113,6 +115,33 @@ func (s *Store) GetFileBySynoID(synoID string) (*File, error) {
 
 	file := &File{}
 	err := s.db.QueryRow(query, synoID).Scan(
+		&file.ID, &file.SynoFileID, &file.Path, &file.Size, &file.ModifiedAt, &file.AccessedAt,
+		&file.Starred, &file.Shared, &file.LastSyncAt, &file.Cached, &file.CachePath,
+		&file.Priority, &file.LastAccessInCacheAt, &file.CreatedAt, &file.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return file, nil
+}
+
+// GetFileByPath retrieves a file by its path
+func (s *Store) GetFileByPath(path string) (*File, error) {
+	query := `
+		SELECT id, syno_file_id, path, size, modified_at, accessed_at,
+			   starred, shared, last_sync_at, cached, cache_path,
+			   priority, last_access_in_cache_at, created_at, updated_at
+		FROM files
+		WHERE path = ?
+	`
+
+	file := &File{}
+	err := s.db.QueryRow(query, path).Scan(
 		&file.ID, &file.SynoFileID, &file.Path, &file.Size, &file.ModifiedAt, &file.AccessedAt,
 		&file.Starred, &file.Shared, &file.LastSyncAt, &file.Cached, &file.CachePath,
 		&file.Priority, &file.LastAccessInCacheAt, &file.CreatedAt, &file.UpdatedAt,
@@ -229,14 +258,14 @@ func (s *Store) GetEvictionCandidates(limit int) ([]*File, error) {
 // CreateShare creates a new share record
 func (s *Store) CreateShare(share *Share) error {
 	query := `
-		INSERT INTO shares (syno_share_id, token, file_id, password, expires_at, revoked)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO shares (syno_share_id, token, sharing_link, url, file_id, password, expires_at, revoked)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	result, err := s.db.Exec(
 		query,
-		share.SynoShareID, share.Token, share.FileID,
-		share.Password, share.ExpiresAt, share.Revoked,
+		share.SynoShareID, share.Token, share.SharingLink, share.URL,
+		share.FileID, share.Password, share.ExpiresAt, share.Revoked,
 	)
 	if err != nil {
 		return err
@@ -254,15 +283,15 @@ func (s *Store) CreateShare(share *Share) error {
 // GetShareByToken retrieves a share by its token
 func (s *Store) GetShareByToken(token string) (*Share, error) {
 	query := `
-		SELECT id, syno_share_id, token, file_id, password, expires_at, created_at, revoked
+		SELECT id, syno_share_id, token, sharing_link, url, file_id, password, expires_at, created_at, revoked
 		FROM shares
 		WHERE token = ?
 	`
 
 	share := &Share{}
 	err := s.db.QueryRow(query, token).Scan(
-		&share.ID, &share.SynoShareID, &share.Token, &share.FileID,
-		&share.Password, &share.ExpiresAt, &share.CreatedAt, &share.Revoked,
+		&share.ID, &share.SynoShareID, &share.Token, &share.SharingLink, &share.URL,
+		&share.FileID, &share.Password, &share.ExpiresAt, &share.CreatedAt, &share.Revoked,
 	)
 
 	if err == sql.ErrNoRows {
@@ -279,11 +308,11 @@ func (s *Store) GetShareByToken(token string) (*Share, error) {
 func (s *Store) UpdateShare(share *Share) error {
 	query := `
 		UPDATE shares SET
-			password = ?, expires_at = ?, revoked = ?
+			sharing_link = ?, url = ?, password = ?, expires_at = ?, revoked = ?
 		WHERE id = ?
 	`
 
-	_, err := s.db.Exec(query, share.Password, share.ExpiresAt, share.Revoked, share.ID)
+	_, err := s.db.Exec(query, share.SharingLink, share.URL, share.Password, share.ExpiresAt, share.Revoked, share.ID)
 	return err
 }
 
@@ -294,7 +323,7 @@ func (s *Store) GetFileByShareToken(token string) (*File, *Share, error) {
 			f.id, f.syno_file_id, f.path, f.size, f.modified_at, f.accessed_at,
 			f.starred, f.shared, f.last_sync_at, f.cached, f.cache_path,
 			f.priority, f.last_access_in_cache_at, f.created_at, f.updated_at,
-			s.id, s.syno_share_id, s.token, s.file_id, s.password, s.expires_at, s.created_at, s.revoked
+			s.id, s.syno_share_id, s.token, s.sharing_link, s.url, s.file_id, s.password, s.expires_at, s.created_at, s.revoked
 		FROM shares s
 		JOIN files f ON s.file_id = f.id
 		WHERE s.token = ?
@@ -307,7 +336,7 @@ func (s *Store) GetFileByShareToken(token string) (*File, *Share, error) {
 		&file.ID, &file.SynoFileID, &file.Path, &file.Size, &file.ModifiedAt, &file.AccessedAt,
 		&file.Starred, &file.Shared, &file.LastSyncAt, &file.Cached, &file.CachePath,
 		&file.Priority, &file.LastAccessInCacheAt, &file.CreatedAt, &file.UpdatedAt,
-		&share.ID, &share.SynoShareID, &share.Token, &share.FileID,
+		&share.ID, &share.SynoShareID, &share.Token, &share.SharingLink, &share.URL, &share.FileID,
 		&share.Password, &share.ExpiresAt, &share.CreatedAt, &share.Revoked,
 	)
 
