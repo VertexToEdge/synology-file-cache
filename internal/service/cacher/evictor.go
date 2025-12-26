@@ -113,7 +113,16 @@ func (e *Evictor) evictUntilSpace(ctx context.Context, neededBytes int64, maxCac
 		}
 
 		if len(candidates) == 0 {
-			return fmt.Errorf("no eviction candidates available")
+			// Log current space situation for debugging
+			cacheSize, _ := e.fs.GetCacheSize()
+			usage, _ := e.fs.GetDiskUsage()
+			e.logger.Warn("no eviction candidates - disk may be full with non-cache files",
+				zap.Int64("cache_size_bytes", cacheSize),
+				zap.Int64("max_cache_size", maxCacheSize),
+				zap.Float64("disk_used_pct", usage.UsedPct),
+				zap.Float64("max_disk_pct", maxDiskUsagePct),
+				zap.Int64("needed_bytes", neededBytes))
+			return fmt.Errorf("no eviction candidates available (cache has no files to evict)")
 		}
 
 		file := candidates[0]

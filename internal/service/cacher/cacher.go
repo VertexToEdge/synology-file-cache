@@ -177,18 +177,34 @@ func (c *Cacher) worker(ctx context.Context, workerID int) {
 
 		// Process the task
 		if err := c.processTask(ctx, task, workerName); err != nil {
-			c.logger.Error("task failed",
-				zap.String("worker", workerName),
-				zap.String("path", task.SynoPath),
-				zap.Int("retry_count", task.RetryCount),
-				zap.Error(err))
+			// For insufficient space, use warn level and longer retry
+			if err == domain.ErrInsufficientSpace {
+				c.logger.Warn("task deferred due to insufficient space",
+					zap.String("worker", workerName),
+					zap.String("path", task.SynoPath),
+					zap.Int64("size", task.Size))
 
-			// Determine if we should retry
-			canRetry := task.RetryCount < task.MaxRetries
-			if err := c.tasks.FailTask(task.ID, err.Error(), canRetry); err != nil {
-				c.logger.Error("failed to mark task as failed",
-					zap.Int64("task_id", task.ID),
+				// Always retry space issues (they may resolve when files are evicted)
+				// FailTask will use exponential backoff
+				if err := c.tasks.FailTask(task.ID, err.Error(), true); err != nil {
+					c.logger.Error("failed to defer task",
+						zap.Int64("task_id", task.ID),
+						zap.Error(err))
+				}
+			} else {
+				c.logger.Error("task failed",
+					zap.String("worker", workerName),
+					zap.String("path", task.SynoPath),
+					zap.Int("retry_count", task.RetryCount),
 					zap.Error(err))
+
+				// Determine if we should retry
+				canRetry := task.RetryCount < task.MaxRetries
+				if err := c.tasks.FailTask(task.ID, err.Error(), canRetry); err != nil {
+					c.logger.Error("failed to mark task as failed",
+						zap.Int64("task_id", task.ID),
+						zap.Error(err))
+				}
 			}
 		} else {
 			if err := c.tasks.CompleteTask(task.ID); err != nil {

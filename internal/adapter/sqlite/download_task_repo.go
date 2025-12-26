@@ -209,6 +209,10 @@ func (s *Store) FailTask(taskID int64, errMsg string, canRetry bool) error {
 		var retryCount int
 		err := s.db.QueryRow("SELECT retry_count FROM download_tasks WHERE id = ?", taskID).Scan(&retryCount)
 		if err != nil {
+			if err == sql.ErrNoRows {
+				// Task was already deleted, nothing to do
+				return nil
+			}
 			return err
 		}
 
