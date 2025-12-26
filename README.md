@@ -26,7 +26,7 @@ Synology Drive HTTP API를 사용해 중요 파일들을 로컬에 프리패치�
                     ┌──────────────────────────────┐
                     │  synology-file-cache         │
                     │  ┌──────────┐  ┌──────────┐ │
-                    │  │ HTTP API │  │  Syncer  │ │
+                    │  │  Server  │  │  Syncer  │ │
                     │  └──────────┘  └──────────┘ │
                     │  ┌──────────┐  ┌──────────┐ │
                     │  │  Cacher  │  │  Store   │ │
@@ -39,14 +39,36 @@ Synology Drive HTTP API를 사용해 중요 파일들을 로컬에 프리패치�
                     └──────────────────────────────┘
 ```
 
+### 계층화된 아키텍처 (Hexagonal Architecture)
+
+프로젝트는 포트-어댑터 패턴을 따르는 계층화된 아키텍처로 구성되어 있습니다:
+
+```
+internal/
+├── domain/          # 도메인 모델 (순수 비즈니스 로직)
+├── port/            # 인터페이스 정의 (포트)
+├── adapter/         # 외부 시스템 어댑터 (SQLite, Synology API, Filesystem)
+├── service/         # 애플리케이션 서비스 (Syncer, Cacher, Server)
+├── config/          # 설정 관리
+└── logger/          # 로깅
+```
+
 ### 주요 컴포넌트
 
-- **HTTP API**: 파일 다운로드 및 디버깅 엔드포인트 제공
-- **DriveSyncer**: Synology Drive API와 주기적 동기화 (풀 스캔/증분)
-- **Cacher**: 우선순위 기반 프리패치 및 LRU eviction 관리
-- **Store**: SQLite 기반 메타데이터 및 상태 관리
-- **FS Manager**: 로컬 파일시스템 관리 및 디스크 사용량 모니터링
-- **Scanner**: 즐겨찾기/라벨 폴더 재귀 스캔
+#### Service Layer
+- **Server**: HTTP 서버 (파일 다운로드, Admin 브라우저, 디버그 엔드포인트)
+- **Syncer**: Synology Drive API와 주기적 동기화 (풀 스캔/증분), Scanner 통합
+- **Cacher**: 우선순위 기반 프리패치, Downloader/Evictor로 책임 분리
+
+#### Adapter Layer
+- **SQLite**: 파일/공유/임시파일 저장소 구현
+- **Synology**: Drive API 클라이언트
+- **Filesystem**: 로컬 파일시스템 관리, 플랫폼별 디스크 사용량 모니터링
+
+#### Domain Layer
+- **File**: 파일 엔티티 및 비즈니스 규칙
+- **Share**: 공유 링크 엔티티
+- **Priority**: 우선순위 상수 및 로직
 
 ## 설치
 
@@ -91,6 +113,9 @@ cache:
   max_disk_usage_percent: 50                # 디스크 사용률 제한 (%)
   recent_modified_days: 30                  # 최근 수정 파일 기준 (일)
   recent_accessed_days: 30                  # 최근 접근 파일 기준 (일)
+  concurrent_downloads: 3                   # 동시 다운로드 수
+  eviction_interval: "30s"                  # 캐시 정리 주기
+  buffer_size_mb: 4                         # 다운로드 버퍼 크기 (MB)
 
 # 동기화 설정
 sync:
@@ -101,12 +126,24 @@ sync:
 
 # HTTP 서버 설정
 http:
-  bind_addr: "0.0.0.0:8080"      # 서비스 바인딩 주소
+  bind_addr: "0.0.0.0:8080"        # 서비스 바인딩 주소
+  enable_admin_browser: false      # Admin 파일 브라우저 활성화
+  admin_username: "admin"          # Admin 인증 사용자명
+  admin_password: ""               # Admin 인증 비밀번호
+  read_timeout: "30s"              # HTTP 읽기 타임아웃
+  write_timeout: "30s"             # HTTP 쓰기 타임아웃
+  idle_timeout: "60s"              # HTTP 유휴 타임아웃
 
 # 로깅 설정
 logging:
   level: "info"                  # debug, info, warn, error
   format: "json"                 # json 또는 text
+
+# 데이터베이스 설정
+database:
+  path: ""                       # DB 경로 (비어있으면 cache.root_dir/cache.db)
+  cache_size_mb: 64              # SQLite 캐시 크기 (MB)
+  busy_timeout_ms: 5000          # SQLite busy 타임아웃 (ms)
 ```
 
 ### 캐시 우선순위
@@ -244,36 +281,43 @@ drive.example.com {
 
 ### ✅ 구현 완료
 
-- 설정 파일 로딩 및 검증 (config)
-- 구조화된 로깅 (logger)
-- SQLite 데이터베이스 (store)
-- HTTP API 서버 (httpapi)
-- Synology Drive API 클라이언트 (synoapi)
-- 동기화 엔진 - DriveSyncer (syncer)
-  - Full sync / Incremental sync
-  - 공유, 즐겨찾기, 라벨, 최근 수정 파일 동기화
-  - mtime 기반 캐시 무효화
-  - 라벨 제외 설정
-- 캐싱 엔진 (cacher)
-  - 우선순위 기반 프리패치
-  - LRU eviction with rate limiting
-- 로컬 파일시스템 관리 (fs)
-  - Atomic 파일 쓰기
-  - 디스크 사용량 모니터링
-- 폴더 재귀 스캔 (scanner)
-- Graceful shutdown
+- **아키텍처 리팩토링 (v0.2.0)**
+  - Hexagonal Architecture (Port-Adapter 패턴) 적용
+  - 도메인/포트/어댑터/서비스 계층 분리
+  - 인터페이스 기반 의존성 역전
+  - 하드코딩 값 설정화 (타임아웃, 버퍼 크기 등)
+
+- **도메인 레이어** (domain/)
+  - File, Share, TempFile 엔티티
+  - Priority 상수 및 비즈니스 규칙
+  - 도메인 에러 타입
+
+- **포트 레이어** (port/)
+  - FileRepository, ShareRepository 인터페이스
+  - DriveClient, FileSystem 인터페이스
+
+- **어댑터 레이어** (adapter/)
+  - SQLite 저장소 (파일/공유/임시파일)
+  - Synology Drive API 클라이언트
+  - 파일시스템 관리 (Windows/Unix 지원)
+
+- **서비스 레이어** (service/)
+  - **Syncer**: 동기화 엔진 (템플릿 메서드로 코드 중복 제거)
+  - **Cacher**: 캐싱 엔진 (Downloader/Evictor 책임 분리)
+  - **Server**: HTTP 서버 (핸들러별 파일 분리)
+
+- **기타 기능**
+  - 비밀번호 보호 공유 링크 처리
+  - Admin 파일 브라우저 (Basic Auth)
+  - HTTP Range 요청 기반 이어받기
+  - 자동 임시 파일 정리
 
 ### 📋 TODO
 
-- [ ] HTTP Range 요청 기반 이어받기 (Resume) 기능
-  - 다운로드 중단 시 이어서 받기 지원
-  - 임시 파일 크기 확인 및 Range 헤더 사용
-  - 대용량 파일 다운로드 안정성 향상
 - [ ] 메트릭 수집 및 노출 (Prometheus)
 - [ ] Docker 이미지 빌드
 - [ ] 통합 테스트 작성
-- [ ] 비밀번호 보호 공유 링크 처리
-- [ ] 공유 링크 만료 처리
+- [ ] 공유 링크 만료 처리 강화
 
 ## 기여하기
 
@@ -297,20 +341,61 @@ go fmt ./...
 
 ```
 .
-├── cmd/                        # 실행 파일 엔트리포인트
-│   └── synology-file-cache/
-├── internal/                   # 내부 패키지
-│   ├── config/                # 설정 관리
-│   ├── logger/                # 로깅
-│   ├── store/                 # 데이터베이스
-│   ├── fs/                    # 파일시스템
-│   ├── synoapi/              # Synology API 클라이언트
-│   ├── syncer/               # 동기화 엔진
-│   ├── scanner/              # 폴더 스캐너
-│   ├── cacher/               # 캐싱 엔진
-│   └── httpapi/              # HTTP API
-├── config.yaml.example        # 설정 파일 예제
-├── CLAUDE.md                  # Claude Code 가이드
+├── cmd/
+│   └── synology-file-cache/    # 애플리케이션 엔트리포인트
+│
+├── internal/
+│   ├── domain/                 # 도메인 모델 (순수 비즈니스 로직)
+│   │   ├── file.go            # File, TempFile, CacheStats 엔티티
+│   │   ├── share.go           # Share 엔티티
+│   │   ├── priority.go        # Priority 상수
+│   │   └── errors.go          # 도메인 에러
+│   │
+│   ├── port/                   # 인터페이스 정의 (포트)
+│   │   ├── repository.go      # FileRepository, ShareRepository 등
+│   │   ├── synology.go        # SynologyClient, DriveClient
+│   │   └── filesystem.go      # FileSystem 인터페이스
+│   │
+│   ├── adapter/                # 외부 시스템 어댑터
+│   │   ├── sqlite/            # SQLite 구현
+│   │   │   ├── store.go       # DB 연결, 마이그레이션
+│   │   │   ├── file_repo.go   # FileRepository 구현
+│   │   │   ├── share_repo.go  # ShareRepository 구현
+│   │   │   └── tempfile_repo.go
+│   │   │
+│   │   ├── synology/          # Synology API 클라이언트
+│   │   │   ├── client.go      # 공통 HTTP 클라이언트
+│   │   │   ├── drive.go       # Drive API 구현
+│   │   │   └── types.go       # API 타입 정의
+│   │   │
+│   │   └── filesystem/        # 파일시스템 구현
+│   │       ├── manager.go     # FileSystem 구현
+│   │       ├── disk_unix.go   # Unix 디스크 사용량
+│   │       └── disk_windows.go # Windows 디스크 사용량
+│   │
+│   ├── service/                # 애플리케이션 서비스
+│   │   ├── syncer/            # 동기화 서비스
+│   │   │   ├── syncer.go      # 메인 Syncer
+│   │   │   ├── file_sync.go   # 파일 동기화 템플릿
+│   │   │   └── scanner.go     # 디렉토리 스캐너
+│   │   │
+│   │   ├── cacher/            # 캐싱 서비스
+│   │   │   ├── cacher.go      # 메인 Cacher
+│   │   │   ├── downloader.go  # 다운로드 워커
+│   │   │   └── evictor.go     # Eviction 정책
+│   │   │
+│   │   └── server/            # HTTP 서버
+│   │       ├── server.go      # 서버 설정/라우팅
+│   │       ├── file_handler.go # 파일 다운로드 핸들러
+│   │       ├── admin_handler.go # Admin 브라우저
+│   │       ├── debug_handler.go # 디버그 엔드포인트
+│   │       └── middleware.go  # 로깅, 인증
+│   │
+│   ├── config/                 # 설정 관리
+│   └── logger/                 # 로깅
+│
+├── config.yaml.example         # 설정 파일 예제
+├── CLAUDE.md                   # Claude Code 가이드
 └── README.md
 ```
 

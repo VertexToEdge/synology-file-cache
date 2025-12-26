@@ -1,12 +1,14 @@
 //go:build windows
 // +build windows
 
-package fs
+package filesystem
 
 import (
 	"fmt"
 	"syscall"
 	"unsafe"
+
+	"github.com/vertextoedge/synology-file-cache/internal/port"
 )
 
 var (
@@ -15,7 +17,7 @@ var (
 )
 
 // GetDiskUsage returns disk usage for the cache directory
-func (m *Manager) GetDiskUsage() (*DiskUsage, error) {
+func (m *Manager) GetDiskUsage() (*port.DiskUsage, error) {
 	var freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes uint64
 
 	// Convert path to UTF16 pointer
@@ -38,7 +40,7 @@ func (m *Manager) GetDiskUsage() (*DiskUsage, error) {
 
 	used := totalNumberOfBytes - totalNumberOfFreeBytes
 
-	return &DiskUsage{
+	return &port.DiskUsage{
 		Total:   totalNumberOfBytes,
 		Used:    used,
 		Free:    totalNumberOfFreeBytes,

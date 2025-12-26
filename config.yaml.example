@@ -8,22 +8,35 @@ synology:
 
 cache:
   root_dir: "./cache-data"
-  max_size_gb: 50
-  max_disk_usage_percent: 50
-  recent_modified_days: 30
-  recent_accessed_days: 30
-  concurrent_downloads: 3  # Number of files to download in parallel (1-10)
+  max_size_gb: 50                      # Maximum cache size in GB
+  max_disk_usage_percent: 50           # Maximum disk usage percentage
+  recent_modified_days: 30             # Include files modified within N days
+  recent_accessed_days: 30             # Include files accessed within N days
+  concurrent_downloads: 5              # Number of parallel download workers (1-10)
+  eviction_interval: "30s"             # How often to check for eviction
+  buffer_size_mb: 8                    # Download buffer size in MB (HTTP + file I/O)
+  stale_task_timeout: "30m"            # Timeout for in-progress tasks (worker recovery)
+  progress_update_interval: "10s"      # How often to update download progress to DB
 
 sync:
-  full_scan_interval: "1h"
-  incremental_interval: "1m"
-  prefetch_interval: "30s"
-  exclude_labels: []  # Labels to exclude from caching, e.g. ["temp", "no-cache"]
+  full_scan_interval: "1h"             # Full metadata sync interval
+  incremental_interval: "1m"           # Incremental sync interval
+  exclude_labels: []                   # Labels to exclude from caching, e.g. ["temp", "no-cache"]
 
 http:
   bind_addr: "0.0.0.0:8080"
-  enable_admin_browser: false  # Enable admin file browser with basic auth (uses synology username/password)
+  enable_admin_browser: false          # Enable admin file browser
+  admin_username: "admin"              # Admin browser username
+  admin_password: ""                   # Admin browser password (empty = disabled)
+  read_timeout: "30s"                  # HTTP read timeout
+  write_timeout: "30s"                 # HTTP write timeout
+  idle_timeout: "60s"                  # HTTP idle timeout
 
 logging:
-  level: "info" # debug, info, warn, error
-  format: "json" # json or text
+  level: "info"                        # debug, info, warn, error
+  format: "json"                       # json or text
+
+database:
+  path: ""                             # Database path (defaults to cache.root_dir/cache.db)
+  cache_size_mb: 64                    # SQLite cache size
+  busy_timeout_ms: 5000                # SQLite busy timeout

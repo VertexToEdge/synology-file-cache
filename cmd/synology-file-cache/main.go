@@ -10,16 +10,18 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vertextoedge/synology-file-cache/internal/cacher"
+	"github.com/vertextoedge/synology-file-cache/internal/adapter/filesystem"
+	"github.com/vertextoedge/synology-file-cache/internal/adapter/sqlite"
+	"github.com/vertextoedge/synology-file-cache/internal/adapter/synology"
 	"github.com/vertextoedge/synology-file-cache/internal/config"
-	"github.com/vertextoedge/synology-file-cache/internal/fs"
-	"github.com/vertextoedge/synology-file-cache/internal/httpapi"
 	"github.com/vertextoedge/synology-file-cache/internal/logger"
-	"github.com/vertextoedge/synology-file-cache/internal/store"
-	"github.com/vertextoedge/synology-file-cache/internal/syncer"
-	"github.com/vertextoedge/synology-file-cache/internal/synoapi"
+	"github.com/vertextoedge/synology-file-cache/internal/service/cacher"
+	"github.com/vertextoedge/synology-file-cache/internal/service/server"
+	"github.com/vertextoedge/synology-file-cache/internal/service/syncer"
 	"go.uber.org/zap"
 )
+
+const version = "0.2.0"
 
 func main() {
 	// Parse command line flags
@@ -40,43 +42,51 @@ func main() {
 	}
 	defer logger.Sync()
 
-	logger.Log.Info("Starting synology-file-cache",
-		"version", "0.1.0",
-		"config", *configPath,
+	zapLogger := logger.GetZapLogger()
+	zapLogger.Info("starting synology-file-cache",
+		zap.String("version", version),
+		zap.String("config", *configPath),
 	)
 
 	// Initialize filesystem manager
-	fsManager, err := fs.NewManager(cfg.Cache.RootDir)
+	fsManager, err := filesystem.NewManagerWithBufferSize(cfg.Cache.RootDir, cfg.Cache.GetBufferSize())
 	if err != nil {
-		logger.Log.Fatalw("Failed to create filesystem manager", "error", err)
+		zapLogger.Fatal("failed to create filesystem manager", zap.Error(err))
 	}
 
 	// Open database
-	dbPath := filepath.Join(cfg.Cache.RootDir, "cache.db")
-	db, err := store.Open(dbPath)
-	if err != nil {
-		logger.Log.Fatalw("Failed to open database", "error", err, "path", dbPath)
+	dbPath := cfg.Database.Path
+	if dbPath == "" {
+		dbPath = filepath.Join(cfg.Cache.RootDir, "cache.db")
 	}
-	defer db.Close()
+
+	store, err := sqlite.Open(dbPath)
+	if err != nil {
+		zapLogger.Fatal("failed to open database", zap.Error(err), zap.String("path", dbPath))
+	}
+	defer store.Close()
 
 	// Create Synology API client
-	synoClient := synoapi.NewClient(
+	synoClient := synology.NewClientWithConfig(
 		cfg.Synology.BaseURL,
 		cfg.Synology.Username,
 		cfg.Synology.Password,
 		cfg.Synology.SkipTLSVerify,
+		&synology.ClientConfig{
+			BufferSizeMB: cfg.Cache.BufferSizeMB,
+		},
 	)
 
 	// Login to Synology
 	if err := synoClient.Login(); err != nil {
-		logger.Log.Fatalw("Failed to login to Synology", "error", err)
+		zapLogger.Fatal("failed to login to Synology", zap.Error(err))
 	}
-	logger.Log.Info("Connected to Synology NAS", "url", cfg.Synology.BaseURL)
+	zapLogger.Info("connected to Synology NAS", zap.String("url", cfg.Synology.BaseURL))
 
-	// Get zap logger for components
-	zapLogger := logger.GetZapLogger()
+	// Create Drive client
+	driveClient := synology.NewDriveClient(synoClient)
 
-	// Create syncer (using Drive API)
+	// Create syncer
 	syncerCfg := &syncer.Config{
 		FullScanInterval:    cfg.Sync.GetFullScanInterval(),
 		IncrementalInterval: cfg.Sync.GetIncrementalInterval(),
@@ -84,27 +94,31 @@ func main() {
 		RecentAccessedDays:  cfg.Cache.RecentAccessedDays,
 		ExcludeLabels:       cfg.Sync.ExcludeLabels,
 	}
-	driveSyncer := syncer.NewDriveSyncer(syncerCfg, synoClient, db, zapLogger)
+	syncerService := syncer.New(syncerCfg, driveClient, store, store, store, zapLogger)
 
 	// Create cacher
 	cacherCfg := &cacher.Config{
-		MaxSizeBytes:        int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024,
-		MaxDiskUsagePercent: float64(cfg.Cache.MaxDiskUsagePercent),
-		PrefetchInterval:    cfg.Sync.GetPrefetchInterval(),
-		BatchSize:           10,
-		ConcurrentDownloads: cfg.Cache.ConcurrentDownloads,
+		MaxSizeBytes:           int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024,
+		MaxDiskUsagePercent:    float64(cfg.Cache.MaxDiskUsagePercent),
+		EvictionInterval:       cfg.Cache.GetEvictionInterval(),
+		ConcurrentDownloads:    cfg.Cache.ConcurrentDownloads,
+		StaleTaskTimeout:       cfg.Cache.GetStaleTaskTimeout(),
+		ProgressUpdateInterval: cfg.Cache.GetProgressUpdateInterval(),
 	}
-	cacherInstance := cacher.New(cacherCfg, synoClient, db, fsManager, zapLogger)
+	cacherService := cacher.New(cacherCfg, driveClient, store, store, fsManager, zapLogger)
 
 	// Create HTTP server
-	httpServer := httpapi.NewServer(
-		cfg.HTTP.BindAddr,
-		db,
-		cfg.Synology.Username,
-		cfg.Synology.Password,
-		cfg.HTTP.EnableAdminBrowser,
-		cfg.Cache.RootDir,
-	)
+	serverCfg := &server.Config{
+		BindAddr:           cfg.HTTP.BindAddr,
+		AdminUsername:      cfg.HTTP.AdminUsername,
+		AdminPassword:      cfg.HTTP.AdminPassword,
+		EnableAdminBrowser: cfg.HTTP.EnableAdminBrowser,
+		CacheRootDir:       cfg.Cache.RootDir,
+		ReadTimeout:        cfg.HTTP.GetReadTimeout(),
+		WriteTimeout:       cfg.HTTP.GetWriteTimeout(),
+		IdleTimeout:        cfg.HTTP.GetIdleTimeout(),
+	}
+	httpServer := server.New(serverCfg, store, zapLogger)
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -113,21 +127,21 @@ func main() {
 	// Start HTTP server
 	go func() {
 		if err := httpServer.Start(); err != nil {
-			logger.Log.Fatalw("HTTP server failed", "error", err)
+			zapLogger.Fatal("HTTP server failed", zap.Error(err))
 		}
 	}()
 
 	// Start syncer
 	go func() {
-		if err := driveSyncer.Start(ctx); err != nil && err != context.Canceled {
-			logger.Log.Errorw("Syncer stopped with error", "error", err)
+		if err := syncerService.Start(ctx); err != nil && err != context.Canceled {
+			zapLogger.Error("syncer stopped with error", zap.Error(err))
 		}
 	}()
 
 	// Start cacher
 	go func() {
-		if err := cacherInstance.Start(ctx); err != nil && err != context.Canceled {
-			logger.Log.Errorw("Cacher stopped with error", "error", err)
+		if err := cacherService.Start(ctx); err != nil && err != context.Canceled {
+			zapLogger.Error("cacher stopped with error", zap.Error(err))
 		}
 	}()
 
@@ -135,13 +149,13 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	logger.Log.Info("Application started successfully",
+	zapLogger.Info("application started successfully",
 		zap.String("http_addr", cfg.HTTP.BindAddr),
 		zap.String("cache_dir", cfg.Cache.RootDir),
 	)
 	<-sigChan
 
-	logger.Log.Info("Shutdown signal received, stopping services...")
+	zapLogger.Info("shutdown signal received, stopping services...")
 
 	// Cancel context to stop syncer and cacher
 	cancel()
@@ -151,18 +165,18 @@ func main() {
 	defer shutdownCancel()
 
 	// Stop syncer and cacher
-	driveSyncer.Stop()
-	cacherInstance.Stop()
+	syncerService.Stop()
+	cacherService.Stop()
 
 	// Stop HTTP server
 	if err := httpServer.Stop(shutdownCtx); err != nil {
-		logger.Log.Errorw("Failed to stop HTTP server gracefully", "error", err)
+		zapLogger.Error("failed to stop HTTP server gracefully", zap.Error(err))
 	}
 
 	// Logout from Synology
 	if err := synoClient.Logout(); err != nil {
-		logger.Log.Errorw("Failed to logout from Synology", "error", err)
+		zapLogger.Error("failed to logout from Synology", zap.Error(err))
 	}
 
-	logger.Log.Info("Application stopped successfully")
+	zapLogger.Info("application stopped successfully")
 }

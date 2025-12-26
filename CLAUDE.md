@@ -24,7 +24,7 @@ go mod tidy
 
 # Run tests
 go test ./...
-go test -v ./internal/store/...  # Test specific package
+go test -v ./internal/adapter/sqlite/...  # Test specific package
 
 # Format code
 go fmt ./...
@@ -35,40 +35,68 @@ go vet ./...
 
 ## Architecture
 
+This project follows **Hexagonal Architecture (Port-Adapter Pattern)** with clear separation of concerns:
+
 ### Core Flow
-1. **DriveSyncer** periodically fetches file metadata from Synology NAS via Drive API
-2. **Store** (SQLite) maintains file metadata, share tokens, and cache state
+1. **Syncer** periodically fetches file metadata from Synology NAS via Drive API
+2. **Store** (SQLite adapter) maintains file metadata, share tokens, and cache state
 3. **Cacher** downloads files based on priority and manages disk usage with LRU eviction
-4. **HTTP API** serves cached files using Synology-compatible share tokens
+4. **Server** serves cached files using Synology-compatible share tokens
 
 ### Package Structure
 
-- `cmd/synology-file-cache/`: Entry point, initializes all components and manages lifecycle
-- `internal/config/`: YAML configuration loading and validation using Viper
-- `internal/store/`: SQLite database layer with File and Share models
-  - Files tracked with priority (1=shared, 2=starred, 3=recent modified, 4=recent accessed)
-  - Shares maintain Synology token compatibility
-- `internal/logger/`: Structured logging with zap (JSON or text format)
-- `internal/httpapi/`: HTTP server for file downloads and debug endpoints
-- `internal/synoapi/`: Synology API client (Drive API + FileStation API)
-  - Authentication with session management
-  - Drive API: shared files, starred files, labels, recent files, file downloads
-  - FileStation API: file info, favorites, share links
-- `internal/syncer/`: DriveSyncer for full and incremental synchronization
-  - Full sync: shared + starred + labeled + recent files
-  - Incremental sync: same as full sync but runs more frequently
-  - mtime-based cache invalidation
-  - Configurable label exclusion
-- `internal/cacher/`: Prefetch and eviction logic
-  - Priority-based caching (lower number = higher priority)
-  - LRU eviction within same priority level
-  - Dual space limits: max_size_gb and max_disk_usage_percent
-  - Rate-limited eviction (30-second minimum interval)
-- `internal/fs/`: Local filesystem management
-  - Atomic file writes (temp file + rename)
-  - Disk usage tracking via syscall
-  - Cache size calculation
-- `internal/scanner/`: Recursive folder scanning for starred/labeled directories
+```
+internal/
+├── domain/                    # Domain models (pure business logic)
+│   ├── file.go               # File, CacheStats entities
+│   ├── download_task.go      # DownloadTask entity for task queue
+│   ├── share.go              # Share entity
+│   ├── priority.go           # Priority constants
+│   └── errors.go             # Domain errors
+
+├── port/                      # Interface definitions (ports)
+│   ├── repository.go         # FileRepository, ShareRepository, DownloadTaskRepository, Store
+│   ├── synology.go           # SynologyClient, DriveClient interfaces
+│   └── filesystem.go         # FileSystem interface
+
+├── adapter/                   # External system adapters
+│   ├── sqlite/               # SQLite implementation
+│   │   ├── store.go          # DB connection, migrations, GetCacheStats
+│   │   ├── file_repo.go      # FileRepository implementation
+│   │   ├── share_repo.go     # ShareRepository implementation
+│   │   └── download_task_repo.go  # DownloadTaskRepository implementation
+│   │
+│   ├── synology/             # Synology API client
+│   │   ├── client.go         # Common HTTP client + session management
+│   │   ├── drive.go          # Drive API implementation
+│   │   └── types.go          # API response types
+│   │
+│   └── filesystem/           # Filesystem implementation
+│       ├── manager.go        # FileSystem interface implementation
+│       ├── disk_unix.go      # Unix disk usage (syscall.Statfs)
+│       └── disk_windows.go   # Windows disk usage (kernel32.dll)
+
+├── service/                   # Application services
+│   ├── syncer/               # Synchronization service
+│   │   ├── syncer.go         # Main Syncer with config, Start/Stop
+│   │   ├── file_sync.go      # Template method for file sync (eliminates duplication)
+│   │   └── scanner.go        # Directory scanner (integrated)
+│   │
+│   ├── cacher/               # Caching service
+│   │   ├── cacher.go         # Main Cacher with worker pool
+│   │   ├── downloader.go     # Download worker with resume support
+│   │   └── evictor.go        # Eviction policy with rate limiting
+│   │
+│   └── server/               # HTTP server
+│       ├── server.go         # Server setup + routing
+│       ├── file_handler.go   # File download handlers (/f/, /d/s/)
+│       ├── admin_handler.go  # Admin browser (/admin/)
+│       ├── debug_handler.go  # Debug endpoints (/debug/)
+│       └── middleware.go     # Logging, BasicAuth middleware
+
+├── config/                    # Configuration management
+└── logger/                    # Structured logging with zap
+```
 
 ### Database Schema
 
@@ -87,8 +115,24 @@ go vet ./...
 - `token`: Synology-compatible share token (permanent_link)
 - `sharing_link`: Full sharing link from AdvanceSharing API
 - `file_id`: References files.id
+- `password`: Password for protected shares
 - `revoked`: Soft delete for expired shares
 - `expires_at`: Optional expiration date
+
+**download_tasks table**: Task queue for download management
+- `file_id`: References files.id
+- `syno_path`: Synology file path (denormalized for easy access)
+- `priority`: Task priority (copy from file for ordering)
+- `size`: File size for space planning
+- `status`: pending, in_progress, failed
+- `worker_id`: Worker identifier for debugging
+- `temp_file_path`: Local temporary file path (e.g., `/cache/path/file.zip.downloading`)
+- `bytes_downloaded`: Bytes downloaded so far (for resume)
+- `retry_count`: Current retry attempt
+- `max_retries`: Maximum retries (default: 3)
+- `next_retry_at`: Scheduled retry time (exponential backoff: 1m, 5m, 30m)
+- `last_error`: Last error message for diagnostics
+- `claimed_at`: When worker claimed the task
 
 ## Configuration
 
@@ -106,19 +150,34 @@ cache:
   max_size_gb: 50                    # Cache size limit
   max_disk_usage_percent: 50         # Disk usage limit
   recent_modified_days: 30           # Include files modified within N days
+  concurrent_downloads: 3            # Parallel download workers
+  eviction_interval: "30s"           # Eviction check interval
+  buffer_size_mb: 4                  # Download buffer size
+  stale_task_timeout: "30m"          # Timeout for in-progress tasks (worker recovery)
+  progress_update_interval: "10s"    # How often to update download progress
 
 sync:
   full_scan_interval: "1h"           # Full sync interval
   incremental_interval: "1m"         # Incremental sync interval
-  prefetch_interval: "30s"           # Cacher prefetch interval
   exclude_labels: []                 # Labels to skip (e.g., ["temp", "no-cache"])
 
 http:
   bind_addr: "0.0.0.0:8080"
+  enable_admin_browser: false        # Admin file browser
+  admin_username: "admin"            # Admin auth username
+  admin_password: ""                 # Admin auth password
+  read_timeout: "30s"                # HTTP read timeout
+  write_timeout: "30s"               # HTTP write timeout
+  idle_timeout: "60s"                # HTTP idle timeout
 
 logging:
   level: "info"   # debug, info, warn, error
   format: "json"  # json or text
+
+database:
+  path: ""                           # DB path (defaults to cache.root_dir/cache.db)
+  cache_size_mb: 64                  # SQLite cache size
+  busy_timeout_ms: 5000              # SQLite busy timeout
 ```
 
 ## Key Implementation Details
@@ -137,15 +196,43 @@ Eviction order: `ORDER BY priority DESC, last_access_in_cache_at ASC` (low prior
 ### Cache Invalidation
 When syncer detects a file's mtime has changed:
 1. Compare new mtime with stored `modified_at`
-2. If newer, set `cached = false` and clear `cache_path`
-3. File becomes eligible for re-download in next cacher loop
+2. If newer, call `file.InvalidateCache()` which sets `cached = false` and clears `cache_path`
+3. Syncer enqueues a new download task for the file
+4. Workers pick up the task and re-download the updated file
 
 ### Space Management
 Two-level enforcement before caching each file:
 1. **Cache size check**: `current_cache + file_size <= max_size_gb`
 2. **Disk usage check**: `disk_used_percent < max_disk_usage_percent`
 
-If either limit exceeded, trigger eviction (rate-limited to 30-second intervals).
+If either limit exceeded, trigger eviction (rate-limited by `eviction_interval`).
+
+### Template Method Pattern (Syncer)
+The `syncFilesWithFetcher` template method eliminates ~200 lines of code duplication:
+```go
+type FileFetcher func(offset, limit int) (*port.DriveListResponse, error)
+
+func (s *Syncer) syncFilesWithFetcher(ctx context.Context, fetcher FileFetcher, priority int) (int, error)
+```
+
+This allows `syncSharedFiles`, `syncStarredFiles`, `syncLabeledFiles`, `syncRecentFiles` to share common pagination and file processing logic.
+
+### Task Queue Based Download System
+The Cacher uses a push-based task queue for downloads:
+
+**Flow:**
+1. **Syncer enqueues tasks**: When processing files, Syncer creates download tasks for uncached files
+2. **Workers claim tasks**: Worker pool atomically claims pending tasks (priority ASC, size ASC)
+3. **Download with resume**: If task has `bytes_downloaded > 0`, resume using HTTP Range header
+4. **Progress tracking**: Periodic progress updates to database for recovery
+5. **Retry on failure**: Exponential backoff (1m, 5m, 30m) with max 3 retries
+6. **Stale task recovery**: Tasks stuck in `in_progress` longer than `stale_task_timeout` are reset to `pending`
+
+**Benefits:**
+- Interrupted downloads automatically resume on server restart
+- Centralized task state management
+- Priority-based download ordering
+- Automatic retry with backoff
 
 ### HTTP API Endpoints
 - `GET /f/{token}`: Serve cached file by permanent_link token
@@ -154,44 +241,46 @@ If either limit exceeded, trigger eviction (rate-limited to 30-second intervals)
 - `GET /health`: Health check (database connectivity)
 - `GET /debug/stats`: Cache statistics (JSON)
 - `GET /debug/files`: List cached files with metadata (JSON)
+- `GET /admin/browse`: Admin file browser (requires Basic Auth)
 
 ### Sync Flow
 ```
-DriveSyncer.Start()
+Syncer.Start()
 ├── FullSync() immediately on start
 ├── fullScanLoop (every full_scan_interval)
-│   └── syncSharedFiles + syncStarredFiles + syncLabeledFiles + syncRecentFiles
+│   └── syncFilesWithFetcher (shared, starred, labeled, recent)
 └── incrementalLoop (every incremental_interval)
-    └── syncSharedFiles + syncStarredFiles + syncLabeledFiles + syncRecentFiles
+    └── syncFilesWithFetcher (shared, starred, labeled, recent)
 ```
-
-Each sync method:
-1. Fetches files from Synology API with pagination
-2. Creates or updates file records in database
-3. Checks mtime and invalidates cache if file was modified
-4. Creates share records for files with permanent_link
 
 ## Current Implementation Status
 
 ✅ **Implemented**:
-- Configuration management with validation
+- Hexagonal Architecture with port-adapter pattern
+- Domain models with business logic (File, Share, DownloadTask, Priority)
+- Interface-based dependency injection
+- Configuration management with validation (all timeouts, buffer sizes configurable)
 - Structured logging with zap
-- SQLite store with migrations and models
-- HTTP server with file serving endpoints
+- SQLite adapter with migrations and repository implementations
+- HTTP server with file serving, admin browser, debug endpoints
+- Password-protected share handling with session management
 - Synology Drive API client (auth, files, shares, labels)
-- DriveSyncer (full sync, incremental sync)
-- mtime-based cache invalidation
-- Label exclusion configuration
-- Cacher with priority-based prefetch
+- Syncer with template method pattern (eliminates code duplication)
+- **Task queue based download system** with worker pool
+- Automatic download resume on server restart
+- Retry with exponential backoff (1m, 5m, 30m)
+- Stale task recovery for crashed workers
+- mtime-based cache invalidation with automatic re-download
 - LRU eviction with rate limiting
 - Local filesystem management with atomic writes
-- Recursive folder scanning for starred directories
+- Platform-specific disk usage (Windows/Unix)
+- HTTP Range request-based resume download
 - Graceful shutdown handling
 
-⚠️ **Partial/TODO**:
-- FileStation API (basic implementation, not primary)
-- Password-protected share handling
-- Share expiration enforcement
+⚠️ **TODO**:
+- Metrics collection (Prometheus)
+- Integration tests
+- Share expiration enforcement enhancement
 
 ## Development Notes
 
@@ -200,3 +289,5 @@ Each sync method:
 - SQLite uses WAL mode for better concurrency
 - All times are stored as UTC in the database
 - Config file contains secrets - use `config.yaml.example` as template, actual `config.yaml` is gitignored
+- Windows support is included (disk_windows.go uses kernel32.dll)
+- Interfaces in `port/` package allow easy mocking for tests

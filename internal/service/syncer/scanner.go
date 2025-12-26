@@ -1,4 +1,4 @@
-package scanner
+package syncer
 
 import (
 	"context"
@@ -7,20 +7,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vertextoedge/synology-file-cache/internal/store"
-	"github.com/vertextoedge/synology-file-cache/internal/synoapi"
+	"github.com/vertextoedge/synology-file-cache/internal/domain"
+	"github.com/vertextoedge/synology-file-cache/internal/port"
 	"go.uber.org/zap"
 )
 
-// Config holds scanner configuration
-type Config struct {
-	MaxConcurrency int // Maximum concurrent API requests
-	BatchSize      int // Number of files to list per API call
+// ScannerConfig holds scanner configuration
+type ScannerConfig struct {
+	MaxConcurrency int
+	BatchSize      int
 }
 
-// DefaultConfig returns default scanner configuration
-func DefaultConfig() *Config {
-	return &Config{
+// DefaultScannerConfig returns default scanner configuration
+func DefaultScannerConfig() *ScannerConfig {
+	return &ScannerConfig{
 		MaxConcurrency: 3,
 		BatchSize:      200,
 	}
@@ -37,13 +37,12 @@ type ScanResult struct {
 
 // Scanner recursively scans paths and adds files to the database
 type Scanner struct {
-	config *Config
-	client *synoapi.Client
-	store  *store.Store
+	config *ScannerConfig
+	drive  port.DriveClient
+	files  port.FileRepository
+	tasks  port.DownloadTaskRepository
 	logger *zap.Logger
-
-	// Worker pool
-	sem chan struct{}
+	sem    chan struct{}
 
 	// Stats
 	stats struct {
@@ -54,10 +53,10 @@ type Scanner struct {
 	}
 }
 
-// New creates a new Scanner
-func New(cfg *Config, client *synoapi.Client, st *store.Store, logger *zap.Logger) *Scanner {
+// NewScanner creates a new Scanner
+func NewScanner(cfg *ScannerConfig, drive port.DriveClient, files port.FileRepository, tasks port.DownloadTaskRepository, logger *zap.Logger) *Scanner {
 	if cfg == nil {
-		cfg = DefaultConfig()
+		cfg = DefaultScannerConfig()
 	}
 	if cfg.MaxConcurrency < 1 {
 		cfg.MaxConcurrency = 1
@@ -68,15 +67,15 @@ func New(cfg *Config, client *synoapi.Client, st *store.Store, logger *zap.Logge
 
 	return &Scanner{
 		config: cfg,
-		client: client,
-		store:  st,
+		drive:  drive,
+		files:  files,
+		tasks:  tasks,
 		logger: logger,
 		sem:    make(chan struct{}, cfg.MaxConcurrency),
 	}
 }
 
 // ScanPath scans a path recursively and adds all files to the database
-// Files are added with the specified priority
 func (s *Scanner) ScanPath(ctx context.Context, path string, priority int) (*ScanResult, error) {
 	start := time.Now()
 
@@ -91,15 +90,12 @@ func (s *Scanner) ScanPath(ctx context.Context, path string, priority int) (*Sca
 		zap.Int("priority", priority),
 		zap.Int("max_concurrency", s.config.MaxConcurrency))
 
-	// Use WaitGroup to track all goroutines
 	var wg sync.WaitGroup
 
-	// Start scanning
 	if err := s.scanDir(ctx, path, priority, &wg); err != nil {
 		return nil, fmt.Errorf("failed to scan path %s: %w", path, err)
 	}
 
-	// Wait for all goroutines to complete
 	wg.Wait()
 
 	result := &ScanResult{
@@ -121,28 +117,6 @@ func (s *Scanner) ScanPath(ctx context.Context, path string, priority int) (*Sca
 	return result, nil
 }
 
-// ScanPathAsync scans a path in the background and returns immediately
-// The result can be retrieved via the returned channel
-func (s *Scanner) ScanPathAsync(ctx context.Context, path string, priority int) <-chan *ScanResult {
-	resultCh := make(chan *ScanResult, 1)
-
-	go func() {
-		defer close(resultCh)
-
-		result, err := s.ScanPath(ctx, path, priority)
-		if err != nil {
-			s.logger.Error("async scan failed",
-				zap.String("path", path),
-				zap.Error(err))
-			resultCh <- &ScanResult{Errors: 1}
-			return
-		}
-		resultCh <- result
-	}()
-
-	return resultCh
-}
-
 // scanDir scans a directory and its subdirectories
 func (s *Scanner) scanDir(ctx context.Context, path string, priority int, wg *sync.WaitGroup) error {
 	offset := 0
@@ -161,7 +135,7 @@ func (s *Scanner) scanDir(ctx context.Context, path string, priority int, wg *sy
 			return ctx.Err()
 		}
 
-		files, err := s.client.DriveListFiles(&synoapi.DriveListOptions{
+		files, err := s.drive.ListFiles(&port.DriveListOptions{
 			Path:   path,
 			Offset: offset,
 			Limit:  s.config.BatchSize,
@@ -222,39 +196,44 @@ func (s *Scanner) scanDir(ctx context.Context, path string, priority int, wg *sy
 	return nil
 }
 
-// processFile adds or updates a file in the database
-func (s *Scanner) processFile(ctx context.Context, file *synoapi.DriveFile, priority int, now *time.Time) error {
-	fileID := file.ID.String()
+// processFile adds or updates a file in the database and enqueues download task
+func (s *Scanner) processFile(ctx context.Context, file *port.DriveFile, priority int, now *time.Time) error {
+	fileID := file.GetIDString()
 
-	existing, err := s.store.GetFileBySynoID(fileID)
+	existing, err := s.files.GetBySynoID(fileID)
 	if err != nil {
 		return fmt.Errorf("failed to check existing file: %w", err)
 	}
 
+	var dbFile *domain.File
+	var isNew bool
+
 	if existing != nil {
-		// Update existing file
+		dbFile = existing
+
+		// Update existing file metadata
 		existing.Path = file.Path
 		existing.Size = file.Size
 		existing.LastSyncAt = now
 
 		// Only lower priority, don't raise it
-		if priority < existing.Priority {
-			existing.Priority = priority
+		existing.UpdatePriority(priority)
+
+		if mtime := file.GetMTime(); mtime != nil {
+			existing.ModifiedAt = mtime
 		}
 
-		if file.MTime > 0 {
-			mtime := time.Unix(file.MTime, 0)
-			existing.ModifiedAt = &mtime
-		}
-
-		if err := s.store.UpdateFile(existing); err != nil {
+		// Use UpdateMetadata to avoid overwriting cache status set by cacher
+		if err := s.files.UpdateMetadata(existing); err != nil {
 			return fmt.Errorf("failed to update file: %w", err)
 		}
 
 		s.stats.updatedFiles.Add(1)
 	} else {
+		isNew = true
+
 		// Create new file
-		newFile := &store.File{
+		newFile := &domain.File{
 			SynoFileID: fileID,
 			Path:       file.Path,
 			Size:       file.Size,
@@ -264,19 +243,18 @@ func (s *Scanner) processFile(ctx context.Context, file *synoapi.DriveFile, prio
 			LastSyncAt: now,
 		}
 
-		if file.MTime > 0 {
-			mtime := time.Unix(file.MTime, 0)
-			newFile.ModifiedAt = &mtime
+		if mtime := file.GetMTime(); mtime != nil {
+			newFile.ModifiedAt = mtime
 		}
-		if file.ATime > 0 {
-			atime := time.Unix(file.ATime, 0)
-			newFile.AccessedAt = &atime
+		if atime := file.GetATime(); atime != nil {
+			newFile.AccessedAt = atime
 		}
 
-		if err := s.store.CreateFile(newFile); err != nil {
+		if err := s.files.Create(newFile); err != nil {
 			return fmt.Errorf("failed to create file: %w", err)
 		}
 
+		dbFile = newFile
 		s.stats.addedFiles.Add(1)
 
 		s.logger.Debug("file added from scan",
@@ -284,5 +262,56 @@ func (s *Scanner) processFile(ctx context.Context, file *synoapi.DriveFile, prio
 			zap.Int("priority", priority))
 	}
 
+	// Enqueue download task if file needs caching
+	if isNew || !dbFile.Cached {
+		s.enqueueDownloadTask(dbFile)
+	}
+
 	return nil
+}
+
+// enqueueDownloadTask creates a download task for a file if one doesn't exist
+func (s *Scanner) enqueueDownloadTask(file *domain.File) {
+	// Re-read file to get latest cached status (avoid race with cacher)
+	latestFile, err := s.files.GetByID(file.ID)
+	if err != nil {
+		s.logger.Warn("failed to re-read file for task enqueue",
+			zap.String("path", file.Path),
+			zap.Error(err))
+		return
+	}
+	if latestFile == nil || latestFile.Cached {
+		// File not found or already cached
+		return
+	}
+
+	// Check if task already exists
+	hasTask, err := s.tasks.HasActiveTask(file.ID)
+	if err != nil {
+		s.logger.Warn("failed to check existing task",
+			zap.String("path", file.Path),
+			zap.Error(err))
+		return
+	}
+
+	if hasTask {
+		return
+	}
+
+	task := &domain.DownloadTask{
+		FileID:     file.ID,
+		SynoPath:   file.Path,
+		Priority:   file.Priority,
+		Size:       file.Size,
+		Status:     domain.TaskStatusPending,
+		MaxRetries: 3,
+	}
+
+	if err := s.tasks.CreateTask(task); err != nil {
+		if err != domain.ErrAlreadyExists {
+			s.logger.Warn("failed to create download task",
+				zap.String("path", file.Path),
+				zap.Error(err))
+		}
+	}
 }
