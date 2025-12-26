@@ -19,6 +19,10 @@ type Config struct {
 	EvictionInterval       time.Duration
 	StaleTaskTimeout       time.Duration
 	ProgressUpdateInterval time.Duration
+	WorkerPollInterval     time.Duration
+	WorkerErrorBackoff     time.Duration
+	EvictionBatchSize      int
+	MaxDownloadRetries     int
 }
 
 // DefaultConfig returns default cacher configuration
@@ -30,19 +34,24 @@ func DefaultConfig() *Config {
 		EvictionInterval:       30 * time.Second,
 		StaleTaskTimeout:       30 * time.Minute,
 		ProgressUpdateInterval: 10 * time.Second,
+		WorkerPollInterval:     time.Second,
+		WorkerErrorBackoff:     5 * time.Second,
+		EvictionBatchSize:      10,
+		MaxDownloadRetries:     3,
 	}
 }
 
 // Cacher handles file caching using a task queue
 type Cacher struct {
-	config     *Config
-	drive      port.DriveClient
-	files      port.FileRepository
-	tasks      port.DownloadTaskRepository
-	fs         port.FileSystem
-	logger     *zap.Logger
-	downloader *Downloader
-	evictor    *Evictor
+	config       *Config
+	drive        port.DriveClient
+	files        port.FileRepository
+	tasks        port.DownloadTaskRepository
+	fs           port.FileSystem
+	logger       *zap.Logger
+	downloader   *Downloader
+	evictor      *Evictor
+	spaceManager *SpaceManager
 
 	mu      sync.Mutex
 	running bool
@@ -74,18 +83,33 @@ func New(
 	if cfg.ProgressUpdateInterval == 0 {
 		cfg.ProgressUpdateInterval = 10 * time.Second
 	}
-
-	c := &Cacher{
-		config: cfg,
-		drive:  drive,
-		files:  files,
-		tasks:  tasks,
-		fs:     fs,
-		logger: logger,
+	if cfg.WorkerPollInterval == 0 {
+		cfg.WorkerPollInterval = time.Second
+	}
+	if cfg.WorkerErrorBackoff == 0 {
+		cfg.WorkerErrorBackoff = 5 * time.Second
+	}
+	if cfg.EvictionBatchSize == 0 {
+		cfg.EvictionBatchSize = 10
+	}
+	if cfg.MaxDownloadRetries == 0 {
+		cfg.MaxDownloadRetries = 3
 	}
 
-	c.downloader = NewDownloader(drive, files, tasks, fs, logger, cfg.MaxSizeBytes, cfg.ProgressUpdateInterval)
-	c.evictor = NewEvictor(files, tasks, fs, logger, cfg.EvictionInterval)
+	spaceManager := NewSpaceManager(fs, cfg.MaxSizeBytes, cfg.MaxDiskUsagePercent)
+
+	c := &Cacher{
+		config:       cfg,
+		drive:        drive,
+		files:        files,
+		tasks:        tasks,
+		fs:           fs,
+		logger:       logger,
+		spaceManager: spaceManager,
+	}
+
+	c.downloader = NewDownloader(drive, tasks, fs, logger, cfg.MaxSizeBytes, cfg.ProgressUpdateInterval)
+	c.evictor = NewEvictor(files, tasks, fs, spaceManager, logger, cfg.EvictionInterval, cfg.EvictionBatchSize)
 
 	return c
 }
@@ -117,10 +141,6 @@ func (c *Cacher) Start(ctx context.Context) error {
 		c.wg.Add(1)
 		go c.worker(ctx, i)
 	}
-
-	// Start maintenance loop
-	c.wg.Add(1)
-	go c.maintenanceLoop(ctx)
 
 	<-ctx.Done()
 	c.wg.Wait()
@@ -159,13 +179,13 @@ func (c *Cacher) worker(ctx context.Context, workerID int) {
 			c.logger.Error("failed to claim task",
 				zap.String("worker", workerName),
 				zap.Error(err))
-			time.Sleep(5 * time.Second)
+			time.Sleep(c.config.WorkerErrorBackoff)
 			continue
 		}
 
 		if task == nil {
 			// No tasks available, wait before polling again
-			time.Sleep(time.Second)
+			time.Sleep(c.config.WorkerPollInterval)
 			continue
 		}
 
@@ -235,7 +255,7 @@ func (c *Cacher) processTask(ctx context.Context, task *domain.DownloadTask, wor
 	}
 
 	// Check space
-	spaceResult, err := c.checkSpaceForFile(task.Size)
+	spaceResult, err := c.spaceManager.CheckSpace(task.Size)
 	if err != nil {
 		return fmt.Errorf("space check failed: %w", err)
 	}
@@ -268,113 +288,33 @@ func (c *Cacher) processTask(ctx context.Context, task *domain.DownloadTask, wor
 		}
 
 		// Re-check space after eviction
-		spaceResult, err = c.checkSpaceForFile(task.Size)
+		spaceResult, err = c.spaceManager.CheckSpace(task.Size)
 		if err != nil || !spaceResult.HasSpace {
 			return domain.ErrInsufficientSpace
 		}
 	}
 
 	// Download with task
-	return c.downloader.DownloadWithTask(ctx, file, task)
-}
-
-// SpaceCheckResult contains detailed space check information
-type SpaceCheckResult struct {
-	HasSpace           bool
-	AvailableBytes     int64
-	CacheSizeBytes     int64
-	MaxCacheSizeBytes  int64
-	DiskUsedPct        float64
-	MaxDiskUsagePct    float64
-	LimitedByCacheSize bool
-	LimitedByDiskUsage bool
-}
-
-// checkSpaceForFile checks if there's enough space for a file
-func (c *Cacher) checkSpaceForFile(fileSize int64) (*SpaceCheckResult, error) {
-	result := &SpaceCheckResult{
-		MaxCacheSizeBytes: c.config.MaxSizeBytes,
-		MaxDiskUsagePct:   c.config.MaxDiskUsagePercent,
-	}
-
-	// Check cache size limit
-	cacheSize, err := c.fs.GetCacheSize()
+	result, err := c.downloader.DownloadWithTask(ctx, file, task)
 	if err != nil {
-		return nil, err
-	}
-	result.CacheSizeBytes = cacheSize
-	result.AvailableBytes = c.config.MaxSizeBytes - cacheSize
-
-	if cacheSize+fileSize > c.config.MaxSizeBytes {
-		result.LimitedByCacheSize = true
-		return result, nil
+		return err
 	}
 
-	// Check disk usage limit
-	usage, err := c.fs.GetDiskUsage()
-	if err != nil {
-		return nil, err
-	}
-	result.DiskUsedPct = usage.UsedPct
+	// Update file as cached (DB update moved from Downloader)
+	now := time.Now()
+	file.MarkCached(result.CachePath)
+	file.Size = result.BytesWritten
+	file.LastAccessInCacheAt = &now
 
-	if usage.UsedPct >= c.config.MaxDiskUsagePercent {
-		result.LimitedByDiskUsage = true
-		return result, nil
-	}
-
-	// Check if adding this file would exceed disk limit
-	newUsedPct := float64(usage.Used+uint64(fileSize)) / float64(usage.Total) * 100
-	if newUsedPct >= c.config.MaxDiskUsagePercent {
-		result.LimitedByDiskUsage = true
-		return result, nil
+	if err := c.files.Update(file); err != nil {
+		// Clean up the cached file if DB update fails
+		c.fs.DeleteFile(result.CachePath)
+		return fmt.Errorf("db update failed: %w", err)
 	}
 
-	result.HasSpace = true
-	return result, nil
+	return nil
 }
 
-// maintenanceLoop handles periodic maintenance tasks
-func (c *Cacher) maintenanceLoop(ctx context.Context) {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	// Cleanup ticker for failed tasks
-	cleanupTicker := time.NewTicker(time.Hour)
-	defer cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// Release stale in-progress tasks (worker died)
-			released, err := c.tasks.ReleaseStaleInProgressTasks(c.config.StaleTaskTimeout)
-			if err != nil {
-				c.logger.Error("failed to release stale tasks", zap.Error(err))
-			} else if released > 0 {
-				c.logger.Info("released stale tasks", zap.Int("count", released))
-			}
-		case <-cleanupTicker.C:
-			// Clear old failed tasks
-			cleared, err := c.tasks.CleanupOldFailedTasks(24 * time.Hour)
-			if err != nil {
-				c.logger.Error("failed to cleanup failed tasks", zap.Error(err))
-			} else if cleared > 0 {
-				c.logger.Info("cleaned up old failed tasks", zap.Int("count", cleared))
-			}
-
-			// Clean old temp files from filesystem
-			fileCount, err := c.fs.CleanOldTempFiles(24 * time.Hour)
-			if err != nil {
-				c.logger.Error("failed to cleanup old temp files", zap.Error(err))
-			} else if fileCount > 0 {
-				c.logger.Info("cleaned up old temp files from filesystem", zap.Int("count", fileCount))
-			}
-		}
-	}
-}
 
 // GetStats returns caching statistics
 func (c *Cacher) GetStats() (map[string]interface{}, error) {

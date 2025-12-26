@@ -3,50 +3,50 @@ package cacher
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/vertextoedge/synology-file-cache/internal/port"
+	"github.com/vertextoedge/synology-file-cache/internal/util/ratelimiter"
 	"go.uber.org/zap"
 )
 
 // Evictor handles cache eviction
 type Evictor struct {
-	files  port.FileRepository
-	tasks  port.DownloadTaskRepository
-	fs     port.FileSystem
-	logger *zap.Logger
-
-	mu               sync.Mutex
-	lastEviction     time.Time
-	evictionInterval time.Duration
+	files        port.FileRepository
+	tasks        port.DownloadTaskRepository
+	fs           port.FileSystem
+	spaceManager port.SpaceManager
+	logger       *zap.Logger
+	limiter      *ratelimiter.Limiter
+	batchSize    int
 }
 
 // NewEvictor creates a new Evictor
-func NewEvictor(files port.FileRepository, tasks port.DownloadTaskRepository, fs port.FileSystem, logger *zap.Logger, evictionInterval time.Duration) *Evictor {
+func NewEvictor(files port.FileRepository, tasks port.DownloadTaskRepository, fs port.FileSystem, spaceManager port.SpaceManager, logger *zap.Logger, evictionInterval time.Duration, batchSize int) *Evictor {
+	if batchSize <= 0 {
+		batchSize = 10
+	}
 	return &Evictor{
-		files:            files,
-		tasks:            tasks,
-		fs:               fs,
-		logger:           logger,
-		evictionInterval: evictionInterval,
+		files:        files,
+		tasks:        tasks,
+		fs:           fs,
+		spaceManager: spaceManager,
+		logger:       logger,
+		limiter:      ratelimiter.New(evictionInterval),
+		batchSize:    batchSize,
 	}
 }
 
 // TryEvict attempts to evict files with rate limiting
 func (e *Evictor) TryEvict(ctx context.Context, neededBytes int64, maxCacheSize int64, maxDiskUsagePct float64) error {
-	e.mu.Lock()
-	timeSinceLastEviction := time.Since(e.lastEviction)
-	if timeSinceLastEviction < e.evictionInterval {
-		e.mu.Unlock()
-		return fmt.Errorf("eviction rate-limited: next eviction in %v", e.evictionInterval-timeSinceLastEviction)
+	allowed, waitTime := e.limiter.Allow()
+	if !allowed {
+		return fmt.Errorf("eviction rate-limited: next eviction in %v", waitTime)
 	}
-	e.lastEviction = time.Now()
-	e.mu.Unlock()
 
 	e.logger.Info("starting eviction",
 		zap.Int64("needed_bytes", neededBytes),
-		zap.Duration("since_last", timeSinceLastEviction))
+		zap.Duration("since_last", e.limiter.TimeSinceLastAllowed()))
 
 	return e.evictUntilSpace(ctx, neededBytes, maxCacheSize, maxDiskUsagePct)
 }
@@ -95,7 +95,7 @@ func (e *Evictor) evictUntilSpace(ctx context.Context, neededBytes int64, maxCac
 		}
 
 		// Check if we have enough space
-		hasSpace, err := e.hasSpace(neededBytes, maxCacheSize, maxDiskUsagePct)
+		hasSpace, err := e.spaceManager.HasSpace(neededBytes)
 		if err != nil {
 			return err
 		}
@@ -106,8 +106,8 @@ func (e *Evictor) evictUntilSpace(ctx context.Context, neededBytes int64, maxCac
 			return nil
 		}
 
-		// Get one candidate for eviction
-		candidates, err := e.files.GetEvictionCandidates(1)
+		// Get batch of candidates for eviction
+		candidates, err := e.files.GetEvictionCandidates(e.batchSize)
 		if err != nil {
 			return fmt.Errorf("failed to get eviction candidates: %w", err)
 		}
@@ -125,62 +125,53 @@ func (e *Evictor) evictUntilSpace(ctx context.Context, neededBytes int64, maxCac
 			return fmt.Errorf("no eviction candidates available (cache has no files to evict)")
 		}
 
-		file := candidates[0]
+		// Process batch of candidates
+		for _, file := range candidates {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 
-		// Evict file
-		if file.CachePath != "" {
-			fileSize := file.Size
-			if err := e.fs.DeleteFile(file.CachePath); err != nil {
-				e.logger.Error("failed to delete cached file",
-					zap.String("path", file.CachePath),
+			// Check if we have enough space after each eviction (early termination)
+			hasSpace, err := e.spaceManager.HasSpace(neededBytes)
+			if err != nil {
+				return err
+			}
+			if hasSpace {
+				e.logger.Info("eviction completed (early termination)",
+					zap.Int("evicted_count", evictedCount),
+					zap.Int64("evicted_bytes", evictedBytes))
+				return nil
+			}
+
+			// Evict file
+			if file.CachePath != "" {
+				fileSize := file.Size
+				if err := e.fs.DeleteFile(file.CachePath); err != nil {
+					e.logger.Error("failed to delete cached file",
+						zap.String("path", file.CachePath),
+						zap.Error(err))
+					continue
+				}
+				evictedBytes += fileSize
+			}
+
+			// Update database
+			file.InvalidateCache()
+
+			if err := e.files.Update(file); err != nil {
+				e.logger.Error("failed to update file after eviction",
+					zap.String("path", file.Path),
 					zap.Error(err))
 				continue
 			}
-			evictedBytes += fileSize
-		}
 
-		// Update database
-		file.InvalidateCache()
-
-		if err := e.files.Update(file); err != nil {
-			e.logger.Error("failed to update file after eviction",
+			evictedCount++
+			e.logger.Debug("file evicted",
 				zap.String("path", file.Path),
-				zap.Error(err))
-			continue
+				zap.Int("priority", file.Priority),
+				zap.Int64("size", file.Size))
 		}
-
-		evictedCount++
-		e.logger.Debug("file evicted",
-			zap.String("path", file.Path),
-			zap.Int("priority", file.Priority),
-			zap.Int64("size", file.Size))
 	}
-}
-
-// hasSpace checks if there's enough space for a file
-func (e *Evictor) hasSpace(fileSize int64, maxCacheSize int64, maxDiskUsagePct float64) (bool, error) {
-	cacheSize, err := e.fs.GetCacheSize()
-	if err != nil {
-		return false, err
-	}
-
-	if cacheSize+fileSize > maxCacheSize {
-		return false, nil
-	}
-
-	usage, err := e.fs.GetDiskUsage()
-	if err != nil {
-		return false, err
-	}
-
-	if usage.UsedPct >= maxDiskUsagePct {
-		return false, nil
-	}
-
-	newUsedPct := float64(usage.Used+uint64(fileSize)) / float64(usage.Total) * 100
-	if newUsedPct >= maxDiskUsagePct {
-		return false, nil
-	}
-
-	return true, nil
 }

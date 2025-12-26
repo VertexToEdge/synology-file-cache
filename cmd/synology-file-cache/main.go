@@ -16,6 +16,7 @@ import (
 	"github.com/vertextoedge/synology-file-cache/internal/config"
 	"github.com/vertextoedge/synology-file-cache/internal/logger"
 	"github.com/vertextoedge/synology-file-cache/internal/service/cacher"
+	"github.com/vertextoedge/synology-file-cache/internal/service/maintenance"
 	"github.com/vertextoedge/synology-file-cache/internal/service/server"
 	"github.com/vertextoedge/synology-file-cache/internal/service/syncer"
 	"go.uber.org/zap"
@@ -93,6 +94,9 @@ func main() {
 		RecentModifiedDays:  cfg.Cache.RecentModifiedDays,
 		RecentAccessedDays:  cfg.Cache.RecentAccessedDays,
 		ExcludeLabels:       cfg.Sync.ExcludeLabels,
+		PageSize:            cfg.Sync.GetPageSize(),
+		MaxDownloadRetries:  cfg.Cache.GetMaxDownloadRetries(),
+		MaxCacheSize:        int64(cfg.Cache.MaxSizeGB) * 1024 * 1024 * 1024,
 	}
 	syncerService := syncer.New(syncerCfg, driveClient, store, store, store, zapLogger)
 
@@ -104,8 +108,22 @@ func main() {
 		ConcurrentDownloads:    cfg.Cache.ConcurrentDownloads,
 		StaleTaskTimeout:       cfg.Cache.GetStaleTaskTimeout(),
 		ProgressUpdateInterval: cfg.Cache.GetProgressUpdateInterval(),
+		WorkerPollInterval:     cfg.Cache.GetWorkerPollInterval(),
+		WorkerErrorBackoff:     cfg.Cache.GetWorkerErrorBackoff(),
+		EvictionBatchSize:      cfg.Cache.GetEvictionBatchSize(),
+		MaxDownloadRetries:     cfg.Cache.GetMaxDownloadRetries(),
 	}
 	cacherService := cacher.New(cacherCfg, driveClient, store, store, fsManager, zapLogger)
+
+	// Create maintenance service
+	maintenanceCfg := &maintenance.Config{
+		StaleTaskCheckInterval: time.Minute,
+		StaleTaskTimeout:       cfg.Cache.GetStaleTaskTimeout(),
+		CleanupInterval:        time.Hour,
+		FailedTaskMaxAge:       24 * time.Hour,
+		TempFileMaxAge:         24 * time.Hour,
+	}
+	maintenanceService := maintenance.New(maintenanceCfg, store, fsManager, zapLogger)
 
 	// Create HTTP server
 	serverCfg := &server.Config{
@@ -145,6 +163,13 @@ func main() {
 		}
 	}()
 
+	// Start maintenance service
+	go func() {
+		if err := maintenanceService.Start(ctx); err != nil && err != context.Canceled {
+			zapLogger.Error("maintenance service stopped with error", zap.Error(err))
+		}
+	}()
+
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -164,9 +189,10 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	// Stop syncer and cacher
+	// Stop syncer, cacher, and maintenance services
 	syncerService.Stop()
 	cacherService.Stop()
+	maintenanceService.Stop()
 
 	// Stop HTTP server
 	if err := httpServer.Stop(shutdownCtx); err != nil {

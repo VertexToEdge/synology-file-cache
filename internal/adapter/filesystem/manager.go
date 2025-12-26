@@ -73,7 +73,7 @@ func (m *Manager) WriteFileWithResume(synoPath string, reader io.Reader, resume 
 
 	// If tempPath is not provided, generate a default one
 	if tempPath == "" {
-		tempPath = cachePath + ".tmp"
+		tempPath = cachePath + ".downloading"
 	}
 
 	var f *os.File
@@ -194,8 +194,7 @@ func (m *Manager) CleanOldTempFiles(olderThan time.Duration) (int, error) {
 		}
 		if !info.IsDir() {
 			ext := filepath.Ext(path)
-			// Clean both .tmp and .downloading files
-			if ext == ".tmp" || ext == ".downloading" {
+			if ext == ".downloading" {
 				if info.ModTime().Before(threshold) {
 					if removeErr := os.Remove(path); removeErr == nil {
 						count++

@@ -19,6 +19,9 @@ type Config struct {
 	ExcludeLabels       []string
 	ScanBatchSize       int
 	ScanConcurrency     int
+	PageSize            int
+	MaxDownloadRetries  int
+	MaxCacheSize        int64 // Maximum file size that can be cached
 }
 
 // DefaultConfig returns default syncer configuration
@@ -30,20 +33,23 @@ func DefaultConfig() *Config {
 		RecentAccessedDays:  30,
 		ScanBatchSize:       200,
 		ScanConcurrency:     3,
+		PageSize:            200,
+		MaxDownloadRetries:  3,
 	}
 }
 
 // Syncer synchronizes file metadata from Synology Drive
 type Syncer struct {
-	config  *Config
-	drive   port.DriveClient
-	files   port.FileRepository
-	shares  port.ShareRepository
-	tasks   port.DownloadTaskRepository
-	logger  *zap.Logger
-	scanner *Scanner
-	running bool
-	cancel  context.CancelFunc
+	config      *Config
+	drive       port.DriveClient
+	files       port.FileRepository
+	shares      port.ShareRepository
+	tasks       port.DownloadTaskRepository
+	logger      *zap.Logger
+	scanner     *Scanner
+	shareSyncer *ShareSyncer
+	running     bool
+	cancel      context.CancelFunc
 }
 
 // New creates a new Syncer
@@ -57,14 +63,17 @@ func New(cfg *Config, drive port.DriveClient, files port.FileRepository, shares 
 		BatchSize:      cfg.ScanBatchSize,
 	}, drive, files, tasks, logger)
 
+	shareSyncer := NewShareSyncer(drive, shares, logger)
+
 	return &Syncer{
-		config:  cfg,
-		drive:   drive,
-		files:   files,
-		shares:  shares,
-		tasks:   tasks,
-		logger:  logger,
-		scanner: scanner,
+		config:      cfg,
+		drive:       drive,
+		files:       files,
+		shares:      shares,
+		tasks:       tasks,
+		logger:      logger,
+		scanner:     scanner,
+		shareSyncer: shareSyncer,
 	}
 }
 

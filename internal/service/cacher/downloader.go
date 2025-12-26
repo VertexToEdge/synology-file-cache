@@ -14,7 +14,6 @@ import (
 // Downloader handles file downloads
 type Downloader struct {
 	drive            port.DriveClient
-	files            port.FileRepository
 	tasks            port.DownloadTaskRepository
 	fs               port.FileSystem
 	logger           *zap.Logger
@@ -25,7 +24,6 @@ type Downloader struct {
 // NewDownloader creates a new Downloader
 func NewDownloader(
 	drive port.DriveClient,
-	files port.FileRepository,
 	tasks port.DownloadTaskRepository,
 	fs port.FileSystem,
 	logger *zap.Logger,
@@ -37,7 +35,6 @@ func NewDownloader(
 	}
 	return &Downloader{
 		drive:            drive,
-		files:            files,
 		tasks:            tasks,
 		fs:               fs,
 		logger:           logger,
@@ -47,7 +44,8 @@ func NewDownloader(
 }
 
 // DownloadWithTask downloads a file using task for state tracking
-func (d *Downloader) DownloadWithTask(ctx context.Context, file *domain.File, task *domain.DownloadTask) error {
+// Returns DownloadResult on success, which the caller should use to update the file record
+func (d *Downloader) DownloadWithTask(ctx context.Context, file *domain.File, task *domain.DownloadTask) (*domain.DownloadResult, error) {
 	d.logger.Debug("downloading file",
 		zap.String("path", file.Path),
 		zap.Int("priority", file.Priority),
@@ -65,7 +63,7 @@ func (d *Downloader) DownloadWithTask(ctx context.Context, file *domain.File, ta
 			d.fs.DeleteTempFile(task.TempFilePath)
 		}
 
-		return fmt.Errorf("file size (%d bytes) exceeds max cache size (%d bytes)", file.Size, d.maxCacheSize)
+		return nil, fmt.Errorf("file size (%d bytes) exceeds max cache size (%d bytes)", file.Size, d.maxCacheSize)
 	}
 
 	// Check for resume
@@ -117,7 +115,7 @@ func (d *Downloader) DownloadWithTask(ctx context.Context, file *domain.File, ta
 	if !resume {
 		body, _, _, err = d.drive.DownloadFile(0, file.Path)
 		if err != nil {
-			return fmt.Errorf("download failed: %w", err)
+			return nil, fmt.Errorf("download failed: %w", err)
 		}
 
 		tempPath = d.fs.CachePath(file.Path) + ".downloading"
@@ -151,18 +149,12 @@ func (d *Downloader) DownloadWithTask(ctx context.Context, file *domain.File, ta
 		if actualSize, _, sizeErr := d.fs.GetTempFileInfo(tempPath); sizeErr == nil {
 			d.tasks.UpdateProgress(task.ID, actualSize, tempPath)
 		}
-		return fmt.Errorf("write failed: %w", err)
+		return nil, fmt.Errorf("write failed: %w", err)
 	}
 
-	// Update file as cached
-	now := time.Now()
-	file.MarkCached(cachePath)
-	file.Size = written
-	file.LastAccessInCacheAt = &now
-
-	if err := d.files.Update(file); err != nil {
-		d.fs.DeleteFile(cachePath)
-		return fmt.Errorf("db update failed: %w", err)
+	resumedFrom := int64(0)
+	if resume {
+		resumedFrom = task.BytesDownloaded
 	}
 
 	if resume && task.BytesDownloaded > 0 {
@@ -176,7 +168,12 @@ func (d *Downloader) DownloadWithTask(ctx context.Context, file *domain.File, ta
 			zap.Int64("size", written))
 	}
 
-	return nil
+	return &domain.DownloadResult{
+		CachePath:    cachePath,
+		BytesWritten: written,
+		Resumed:      resume,
+		ResumedFrom:  resumedFrom,
+	}, nil
 }
 
 // progressReader wraps a reader to report download progress

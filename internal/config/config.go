@@ -37,6 +37,10 @@ type CacheConfig struct {
 	BufferSizeMB           int    `mapstructure:"buffer_size_mb"`
 	StaleTaskTimeout       string `mapstructure:"stale_task_timeout"`
 	ProgressUpdateInterval string `mapstructure:"progress_update_interval"`
+	WorkerPollInterval     string `mapstructure:"worker_poll_interval"`
+	WorkerErrorBackoff     string `mapstructure:"worker_error_backoff"`
+	EvictionBatchSize      int    `mapstructure:"eviction_batch_size"`
+	MaxDownloadRetries     int    `mapstructure:"max_download_retries"`
 }
 
 // SyncConfig contains synchronization settings
@@ -45,6 +49,7 @@ type SyncConfig struct {
 	IncrementalInterval string   `mapstructure:"incremental_interval"`
 	PrefetchInterval    string   `mapstructure:"prefetch_interval"`
 	ExcludeLabels       []string `mapstructure:"exclude_labels"` // Labels to exclude from caching
+	PageSize            int      `mapstructure:"page_size"`      // Pagination size for API calls
 }
 
 // HTTPConfig contains HTTP server configuration
@@ -86,9 +91,14 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("cache.buffer_size_mb", 8)
 	viper.SetDefault("cache.stale_task_timeout", "30m")
 	viper.SetDefault("cache.progress_update_interval", "10s")
+	viper.SetDefault("cache.worker_poll_interval", "1s")
+	viper.SetDefault("cache.worker_error_backoff", "5s")
+	viper.SetDefault("cache.eviction_batch_size", 10)
+	viper.SetDefault("cache.max_download_retries", 3)
 	viper.SetDefault("sync.full_scan_interval", "1h")
 	viper.SetDefault("sync.incremental_interval", "1m")
 	viper.SetDefault("sync.prefetch_interval", "30s")
+	viper.SetDefault("sync.page_size", 200)
 	viper.SetDefault("http.bind_addr", "0.0.0.0:8080")
 	viper.SetDefault("http.enable_admin_browser", false)
 	viper.SetDefault("http.read_timeout", "30s")
@@ -249,4 +259,46 @@ func (c *HTTPConfig) GetIdleTimeout() time.Duration {
 		return 60 * time.Second
 	}
 	return d
+}
+
+// GetWorkerPollInterval returns the worker poll interval as time.Duration
+func (c *CacheConfig) GetWorkerPollInterval() time.Duration {
+	d, _ := time.ParseDuration(c.WorkerPollInterval)
+	if d == 0 {
+		return time.Second
+	}
+	return d
+}
+
+// GetWorkerErrorBackoff returns the worker error backoff as time.Duration
+func (c *CacheConfig) GetWorkerErrorBackoff() time.Duration {
+	d, _ := time.ParseDuration(c.WorkerErrorBackoff)
+	if d == 0 {
+		return 5 * time.Second
+	}
+	return d
+}
+
+// GetEvictionBatchSize returns the eviction batch size
+func (c *CacheConfig) GetEvictionBatchSize() int {
+	if c.EvictionBatchSize <= 0 {
+		return 10
+	}
+	return c.EvictionBatchSize
+}
+
+// GetMaxDownloadRetries returns the max download retries
+func (c *CacheConfig) GetMaxDownloadRetries() int {
+	if c.MaxDownloadRetries <= 0 {
+		return 3
+	}
+	return c.MaxDownloadRetries
+}
+
+// GetPageSize returns the pagination size for API calls
+func (c *SyncConfig) GetPageSize() int {
+	if c.PageSize <= 0 {
+		return 200
+	}
+	return c.PageSize
 }

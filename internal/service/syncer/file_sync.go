@@ -28,7 +28,10 @@ func (s *Syncer) syncFilesWithFetcher(ctx context.Context, fetcher FileFetcher, 
 	now := time.Now()
 	count := 0
 	offset := 0
-	limit := 200
+	limit := s.config.PageSize
+	if limit <= 0 {
+		limit = 200
+	}
 
 	for {
 		select {
@@ -163,7 +166,11 @@ func (s *Syncer) processFile(ctx context.Context, file *port.DriveFile, priority
 
 		// Create share record if needed
 		if opts != nil && opts.CreateShareRecords && file.PermanentLink != "" {
-			s.createOrUpdateShareRecord(existing.ID, fileIDInt, file.PermanentLink)
+			if err := s.shareSyncer.CreateOrUpdateShare(existing.ID, fileIDInt, file.PermanentLink); err != nil {
+				s.logger.Warn("failed to create/update share record",
+					zap.String("path", file.Path),
+					zap.Error(err))
+			}
 		}
 	} else {
 		isNew = true
@@ -204,7 +211,11 @@ func (s *Syncer) processFile(ctx context.Context, file *port.DriveFile, priority
 
 		// Create share record if needed
 		if opts != nil && opts.CreateShareRecords && file.PermanentLink != "" {
-			s.createOrUpdateShareRecord(newFile.ID, fileIDInt, file.PermanentLink)
+			if err := s.shareSyncer.CreateOrUpdateShare(newFile.ID, fileIDInt, file.PermanentLink); err != nil {
+				s.logger.Warn("failed to create share record",
+					zap.String("path", file.Path),
+					zap.Error(err))
+			}
 		}
 
 		s.logger.Debug("file added",
@@ -243,6 +254,15 @@ func (s *Syncer) enqueueDownloadTask(file *domain.File) {
 		return
 	}
 
+	// Skip if file size exceeds max cache size
+	if s.config.MaxCacheSize > 0 && latestFile.Size > s.config.MaxCacheSize {
+		s.logger.Debug("file too large for cache, skipping task enqueue",
+			zap.String("path", file.Path),
+			zap.Int64("size", latestFile.Size),
+			zap.Int64("max_cache_size", s.config.MaxCacheSize))
+		return
+	}
+
 	// Check if task already exists
 	hasTask, err := s.tasks.HasActiveTask(file.ID)
 	if err != nil {
@@ -258,13 +278,18 @@ func (s *Syncer) enqueueDownloadTask(file *domain.File) {
 		return
 	}
 
+	maxRetries := s.config.MaxDownloadRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
 	task := &domain.DownloadTask{
 		FileID:     file.ID,
 		SynoPath:   file.Path,
 		Priority:   file.Priority,
 		Size:       file.Size,
 		Status:     domain.TaskStatusPending,
-		MaxRetries: 3,
+		MaxRetries: maxRetries,
 	}
 
 	if err := s.tasks.CreateTask(task); err != nil {
@@ -284,86 +309,3 @@ func (s *Syncer) enqueueDownloadTask(file *domain.File) {
 		zap.Int("priority", file.Priority))
 }
 
-// createOrUpdateShareRecord creates or updates a share record
-func (s *Syncer) createOrUpdateShareRecord(fileID int64, synoFileID int64, token string) {
-	// Check if share already exists
-	existingShare, err := s.shares.GetShareByToken(token)
-	if err != nil {
-		s.logger.Warn("failed to check existing share",
-			zap.String("token", token),
-			zap.Error(err))
-		return
-	}
-
-	if existingShare != nil {
-		// Update with advance sharing info
-		s.updateShareWithAdvanceSharing(existingShare, synoFileID)
-		return
-	}
-
-	// Get advanced sharing info
-	var sharingLink, fullURL, password string
-	var expiresAt *time.Time
-
-	advInfo, err := s.drive.GetAdvanceSharing(synoFileID, "")
-	if err != nil {
-		s.logger.Warn("failed to get advance sharing info",
-			zap.String("token", token),
-			zap.Error(err))
-	} else {
-		sharingLink = advInfo.SharingLink
-		fullURL = advInfo.URL
-		password = advInfo.ProtectPassword
-		expiresAt = advInfo.GetExpiresAt()
-	}
-
-	// Create new share record
-	newShare := &domain.Share{
-		SynoShareID: fmt.Sprintf("%d", synoFileID),
-		Token:       token,
-		SharingLink: sharingLink,
-		URL:         fullURL,
-		FileID:      fileID,
-		Password:    password,
-		ExpiresAt:   expiresAt,
-		Revoked:     false,
-	}
-
-	if err := s.shares.CreateShare(newShare); err != nil {
-		s.logger.Warn("failed to create share",
-			zap.String("token", token),
-			zap.Error(err))
-		return
-	}
-
-	s.logger.Debug("share record created",
-		zap.String("token", token),
-		zap.String("sharing_link", sharingLink))
-}
-
-// updateShareWithAdvanceSharing updates a share with AdvanceSharing info
-func (s *Syncer) updateShareWithAdvanceSharing(share *domain.Share, synoFileID int64) {
-	advInfo, err := s.drive.GetAdvanceSharing(synoFileID, "")
-	if err != nil {
-		s.logger.Warn("failed to get advance sharing info for update",
-			zap.String("token", share.Token),
-			zap.Error(err))
-		return
-	}
-
-	share.SharingLink = advInfo.SharingLink
-	share.URL = advInfo.URL
-	share.Password = advInfo.ProtectPassword
-	share.ExpiresAt = advInfo.GetExpiresAt()
-
-	if err := s.shares.UpdateShare(share); err != nil {
-		s.logger.Warn("failed to update share",
-			zap.String("token", share.Token),
-			zap.Error(err))
-		return
-	}
-
-	s.logger.Debug("share record updated",
-		zap.String("token", share.Token),
-		zap.Bool("has_password", advInfo.ProtectPassword != ""))
-}
