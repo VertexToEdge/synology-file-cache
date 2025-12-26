@@ -51,8 +51,6 @@ type SyncConfig struct {
 type HTTPConfig struct {
 	BindAddr           string `mapstructure:"bind_addr"`
 	EnableAdminBrowser bool   `mapstructure:"enable_admin_browser"`
-	AdminUsername      string `mapstructure:"admin_username"`
-	AdminPassword      string `mapstructure:"admin_password"`
 	ReadTimeout        string `mapstructure:"read_timeout"`
 	WriteTimeout       string `mapstructure:"write_timeout"`
 	IdleTimeout        string `mapstructure:"idle_timeout"`
@@ -93,8 +91,6 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("sync.prefetch_interval", "30s")
 	viper.SetDefault("http.bind_addr", "0.0.0.0:8080")
 	viper.SetDefault("http.enable_admin_browser", false)
-	viper.SetDefault("http.admin_username", "admin")
-	viper.SetDefault("http.admin_password", "")
 	viper.SetDefault("http.read_timeout", "30s")
 	viper.SetDefault("http.write_timeout", "30s")
 	viper.SetDefault("http.idle_timeout", "60s")

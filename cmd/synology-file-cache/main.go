@@ -110,8 +110,8 @@ func main() {
 	// Create HTTP server
 	serverCfg := &server.Config{
 		BindAddr:           cfg.HTTP.BindAddr,
-		AdminUsername:      cfg.HTTP.AdminUsername,
-		AdminPassword:      cfg.HTTP.AdminPassword,
+		AdminUsername:      cfg.Synology.Username,
+		AdminPassword:      cfg.Synology.Password,
 		EnableAdminBrowser: cfg.HTTP.EnableAdminBrowser,
 		CacheRootDir:       cfg.Cache.RootDir,
 		ReadTimeout:        cfg.HTTP.GetReadTimeout(),

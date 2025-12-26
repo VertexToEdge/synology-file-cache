@@ -163,9 +163,7 @@ sync:
 
 http:
   bind_addr: "0.0.0.0:8080"
-  enable_admin_browser: false        # Admin file browser
-  admin_username: "admin"            # Admin auth username
-  admin_password: ""                 # Admin auth password
+  enable_admin_browser: false        # Admin file browser (uses synology credentials)
   read_timeout: "30s"                # HTTP read timeout
   write_timeout: "30s"               # HTTP write timeout
   idle_timeout: "60s"                # HTTP idle timeout

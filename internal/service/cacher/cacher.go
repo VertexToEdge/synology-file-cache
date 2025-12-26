@@ -235,16 +235,29 @@ func (c *Cacher) processTask(ctx context.Context, task *domain.DownloadTask, wor
 	}
 
 	// Check space
-	hasSpace, availableBytes, err := c.checkSpaceForFile(task.Size)
+	spaceResult, err := c.checkSpaceForFile(task.Size)
 	if err != nil {
 		return fmt.Errorf("space check failed: %w", err)
 	}
 
-	if !hasSpace {
-		c.logger.Debug("not enough space, attempting eviction",
-			zap.String("worker", workerName),
-			zap.Int64("needed", task.Size),
-			zap.Int64("available", availableBytes))
+	if !spaceResult.HasSpace {
+		// Log which limit is causing the issue
+		if spaceResult.LimitedByCacheSize {
+			c.logger.Warn("cache size limit reached, attempting eviction",
+				zap.String("worker", workerName),
+				zap.String("path", task.SynoPath),
+				zap.Int64("file_size", task.Size),
+				zap.Int64("cache_size", spaceResult.CacheSizeBytes),
+				zap.Int64("max_cache_size", spaceResult.MaxCacheSizeBytes),
+				zap.Int64("available", spaceResult.AvailableBytes))
+		} else if spaceResult.LimitedByDiskUsage {
+			c.logger.Warn("disk usage limit reached, attempting eviction",
+				zap.String("worker", workerName),
+				zap.String("path", task.SynoPath),
+				zap.Int64("file_size", task.Size),
+				zap.Float64("disk_used_pct", spaceResult.DiskUsedPct),
+				zap.Float64("max_disk_pct", spaceResult.MaxDiskUsagePct))
+		}
 
 		if err := c.evictor.TryEvict(ctx, task.Size, c.config.MaxSizeBytes, c.config.MaxDiskUsagePercent); err != nil {
 			c.logger.Warn("eviction failed or rate-limited",
@@ -255,8 +268,8 @@ func (c *Cacher) processTask(ctx context.Context, task *domain.DownloadTask, wor
 		}
 
 		// Re-check space after eviction
-		hasSpace, _, err = c.checkSpaceForFile(task.Size)
-		if err != nil || !hasSpace {
+		spaceResult, err = c.checkSpaceForFile(task.Size)
+		if err != nil || !spaceResult.HasSpace {
 			return domain.ErrInsufficientSpace
 		}
 	}
@@ -265,36 +278,59 @@ func (c *Cacher) processTask(ctx context.Context, task *domain.DownloadTask, wor
 	return c.downloader.DownloadWithTask(ctx, file, task)
 }
 
+// SpaceCheckResult contains detailed space check information
+type SpaceCheckResult struct {
+	HasSpace           bool
+	AvailableBytes     int64
+	CacheSizeBytes     int64
+	MaxCacheSizeBytes  int64
+	DiskUsedPct        float64
+	MaxDiskUsagePct    float64
+	LimitedByCacheSize bool
+	LimitedByDiskUsage bool
+}
+
 // checkSpaceForFile checks if there's enough space for a file
-func (c *Cacher) checkSpaceForFile(fileSize int64) (bool, int64, error) {
+func (c *Cacher) checkSpaceForFile(fileSize int64) (*SpaceCheckResult, error) {
+	result := &SpaceCheckResult{
+		MaxCacheSizeBytes: c.config.MaxSizeBytes,
+		MaxDiskUsagePct:   c.config.MaxDiskUsagePercent,
+	}
+
 	// Check cache size limit
 	cacheSize, err := c.fs.GetCacheSize()
 	if err != nil {
-		return false, 0, err
+		return nil, err
 	}
+	result.CacheSizeBytes = cacheSize
+	result.AvailableBytes = c.config.MaxSizeBytes - cacheSize
 
-	availableBySize := c.config.MaxSizeBytes - cacheSize
 	if cacheSize+fileSize > c.config.MaxSizeBytes {
-		return false, availableBySize, nil
+		result.LimitedByCacheSize = true
+		return result, nil
 	}
 
 	// Check disk usage limit
 	usage, err := c.fs.GetDiskUsage()
 	if err != nil {
-		return false, 0, err
+		return nil, err
 	}
+	result.DiskUsedPct = usage.UsedPct
 
 	if usage.UsedPct >= c.config.MaxDiskUsagePercent {
-		return false, availableBySize, nil
+		result.LimitedByDiskUsage = true
+		return result, nil
 	}
 
 	// Check if adding this file would exceed disk limit
 	newUsedPct := float64(usage.Used+uint64(fileSize)) / float64(usage.Total) * 100
 	if newUsedPct >= c.config.MaxDiskUsagePercent {
-		return false, availableBySize, nil
+		result.LimitedByDiskUsage = true
+		return result, nil
 	}
 
-	return true, availableBySize, nil
+	result.HasSpace = true
+	return result, nil
 }
 
 // maintenanceLoop handles periodic maintenance tasks
