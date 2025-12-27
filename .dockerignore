@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+synology-file-cache
+synology-file-cache.exe
+*.exe
+
+# Cache data
+cache-data/
+*.db
+
+# Configuration with secrets
+config.yaml
+
+# Documentation (keep README for reference)
+CLAUDE.md
+
+# Test files
+*_test.go
+
+# Docker files (not needed in build context recursively)
+docker-compose*.yaml
+docker-compose*.yml

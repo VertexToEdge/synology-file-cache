@@ -1,0 +1,46 @@
+services:
+  synology-file-cache:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: synology-file-cache:latest
+    container_name: synology-file-cache
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Cache data directory (persistent)
+      - ./cache-data:/data
+      # Optional: mount config file instead of using environment variables
+      # - ./config.yaml:/config/config.yaml:ro
+    environment:
+      - TZ=Asia/Seoul
+      # Synology NAS connection (required)
+      - SFC_SYNOLOGY_BASE_URL=https://your-nas.example.com
+      - SFC_SYNOLOGY_USERNAME=admin
+      - SFC_SYNOLOGY_PASSWORD=your_password
+      - SFC_SYNOLOGY_SKIP_TLS_VERIFY=false
+      # Cache settings
+      - SFC_CACHE_ROOT_DIR=/data
+      - SFC_CACHE_MAX_SIZE_GB=50
+      - SFC_CACHE_MAX_DISK_USAGE_PERCENT=80
+      - SFC_CACHE_CONCURRENT_DOWNLOADS=5
+      # Sync settings
+      - SFC_SYNC_FULL_SCAN_INTERVAL=1h
+      - SFC_SYNC_INCREMENTAL_INTERVAL=1m
+      # HTTP settings
+      - SFC_HTTP_BIND_ADDR=0.0.0.0:8080
+      - SFC_HTTP_ENABLE_ADMIN_BROWSER=false
+      # Logging
+      - SFC_LOGGING_LEVEL=info
+      - SFC_LOGGING_FORMAT=json
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start-period: 10s
+      retries: 3
+
+volumes:
+  cache-data:
+    driver: local

@@ -78,7 +78,36 @@ internal/
 - SQLite3
 - Linux/macOS (Windows는 WSL2 권장)
 
-### 빌드
+### Docker로 실행 (권장)
+
+가장 쉬운 방법은 Docker를 사용하는 것입니다:
+
+```bash
+# 저장소 클론
+git clone https://github.com/VertexToEdge/synology-file-cache.git
+cd synology-file-cache
+
+# docker-compose.yaml의 환경변수 수정 후 실행
+docker compose up -d
+
+# 로그 확인
+docker compose logs -f
+```
+
+또는 환경변수를 직접 지정하여 실행:
+
+```bash
+docker run -d \
+  --name synology-file-cache \
+  -p 8080:8080 \
+  -v cache-data:/data \
+  -e SFC_SYNOLOGY_BASE_URL=https://your-nas.example.com \
+  -e SFC_SYNOLOGY_USERNAME=admin \
+  -e SFC_SYNOLOGY_PASSWORD=your_password \
+  synology-file-cache:latest
+```
+
+### 직접 빌드
 
 ```bash
 # 저장소 클론
@@ -91,6 +120,52 @@ go build -o synology-file-cache ./cmd/synology-file-cache
 ```
 
 ## 설정
+
+설정은 YAML 파일 또는 환경변수로 지정할 수 있습니다. 환경변수가 설정 파일보다 우선합니다.
+
+### 환경변수
+
+모든 설정은 `SFC_` 접두어와 함께 환경변수로 설정 가능합니다. 점(`.`)은 언더스코어(`_`)로 변환됩니다.
+
+| 환경변수 | 설정 키 | 기본값 | 설명 |
+|---------|--------|-------|------|
+| **Synology 연결 (필수)** ||||
+| `SFC_SYNOLOGY_BASE_URL` | synology.base_url | - | Synology NAS URL |
+| `SFC_SYNOLOGY_USERNAME` | synology.username | - | 사용자명 |
+| `SFC_SYNOLOGY_PASSWORD` | synology.password | - | 비밀번호 |
+| `SFC_SYNOLOGY_SKIP_TLS_VERIFY` | synology.skip_tls_verify | `false` | TLS 인증서 검증 무시 |
+| **캐시 설정** ||||
+| `SFC_CACHE_ROOT_DIR` | cache.root_dir | `/data` | 캐시 저장 경로 |
+| `SFC_CACHE_MAX_SIZE_GB` | cache.max_size_gb | `50` | 최대 캐시 크기 (GB) |
+| `SFC_CACHE_MAX_DISK_USAGE_PERCENT` | cache.max_disk_usage_percent | `50` | 디스크 사용률 제한 (%) |
+| `SFC_CACHE_RECENT_MODIFIED_DAYS` | cache.recent_modified_days | `30` | 최근 수정 파일 기준 (일) |
+| `SFC_CACHE_RECENT_ACCESSED_DAYS` | cache.recent_accessed_days | `30` | 최근 접근 파일 기준 (일) |
+| `SFC_CACHE_CONCURRENT_DOWNLOADS` | cache.concurrent_downloads | `3` | 동시 다운로드 수 (1-10) |
+| `SFC_CACHE_EVICTION_INTERVAL` | cache.eviction_interval | `30s` | 캐시 정리 주기 |
+| `SFC_CACHE_BUFFER_SIZE_MB` | cache.buffer_size_mb | `8` | 다운로드 버퍼 크기 (MB) |
+| `SFC_CACHE_STALE_TASK_TIMEOUT` | cache.stale_task_timeout | `30m` | 정체된 작업 타임아웃 |
+| `SFC_CACHE_PROGRESS_UPDATE_INTERVAL` | cache.progress_update_interval | `10s` | 진행률 업데이트 주기 |
+| `SFC_CACHE_MAX_DOWNLOAD_RETRIES` | cache.max_download_retries | `3` | 최대 다운로드 재시도 횟수 |
+| **동기화 설정** ||||
+| `SFC_SYNC_FULL_SCAN_INTERVAL` | sync.full_scan_interval | `1h` | 전체 스캔 주기 |
+| `SFC_SYNC_INCREMENTAL_INTERVAL` | sync.incremental_interval | `1m` | 증분 동기화 주기 |
+| `SFC_SYNC_PREFETCH_INTERVAL` | sync.prefetch_interval | `30s` | 프리패치 실행 주기 |
+| `SFC_SYNC_PAGE_SIZE` | sync.page_size | `200` | API 페이지 크기 |
+| **HTTP 서버 설정** ||||
+| `SFC_HTTP_BIND_ADDR` | http.bind_addr | `0.0.0.0:8080` | 바인딩 주소 |
+| `SFC_HTTP_ENABLE_ADMIN_BROWSER` | http.enable_admin_browser | `false` | Admin 브라우저 활성화 |
+| `SFC_HTTP_READ_TIMEOUT` | http.read_timeout | `30s` | HTTP 읽기 타임아웃 |
+| `SFC_HTTP_WRITE_TIMEOUT` | http.write_timeout | `30s` | HTTP 쓰기 타임아웃 |
+| `SFC_HTTP_IDLE_TIMEOUT` | http.idle_timeout | `60s` | HTTP 유휴 타임아웃 |
+| **로깅 설정** ||||
+| `SFC_LOGGING_LEVEL` | logging.level | `info` | 로그 레벨 (debug/info/warn/error) |
+| `SFC_LOGGING_FORMAT` | logging.format | `json` | 로그 포맷 (json/text) |
+| **데이터베이스 설정** ||||
+| `SFC_DATABASE_PATH` | database.path | `{root_dir}/cache.db` | 데이터베이스 경로 |
+| `SFC_DATABASE_CACHE_SIZE_MB` | database.cache_size_mb | `64` | SQLite 캐시 크기 (MB) |
+| `SFC_DATABASE_BUSY_TIMEOUT_MS` | database.busy_timeout_ms | `5000` | SQLite busy 타임아웃 (ms) |
+
+### YAML 설정 파일
 
 `config.yaml.example`을 복사하여 `config.yaml`로 설정합니다:
 
@@ -315,7 +390,6 @@ drive.example.com {
 ### 📋 TODO
 
 - [ ] 메트릭 수집 및 노출 (Prometheus)
-- [ ] Docker 이미지 빌드
 - [ ] 통합 테스트 작성
 - [ ] 공유 링크 만료 처리 강화
 

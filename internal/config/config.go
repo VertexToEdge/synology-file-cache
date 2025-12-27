@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -75,13 +77,52 @@ type DatabaseConfig struct {
 }
 
 // Load loads configuration from the specified file path
+// Configuration priority: environment variables > config file > defaults
 func Load(configPath string) (*Config, error) {
-	viper.SetConfigFile(configPath)
-	viper.SetConfigType("yaml")
+	// Set defaults first
+	setDefaults()
 
-	// Set defaults
+	// Enable environment variable support
+	// Environment variables use SFC_ prefix and replace . with _
+	// Example: synology.base_url -> SFC_SYNOLOGY_BASE_URL
+	viper.SetEnvPrefix("SFC")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+
+	// Try to read config file if it exists
+	if configPath != "" {
+		viper.SetConfigFile(configPath)
+		viper.SetConfigType("yaml")
+
+		if err := viper.ReadInConfig(); err != nil {
+			// Config file is optional if environment variables are set
+			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+				// Check if file exists
+				if _, statErr := os.Stat(configPath); statErr == nil {
+					return nil, fmt.Errorf("failed to read config file: %w", err)
+				}
+				// File doesn't exist, continue with env vars only
+			}
+		}
+	}
+
+	var config Config
+	if err := viper.Unmarshal(&config); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// Validate configuration
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
+
+	return &config, nil
+}
+
+// setDefaults sets all default values for configuration
+func setDefaults() {
 	viper.SetDefault("synology.skip_tls_verify", false)
-	viper.SetDefault("cache.root_dir", "/var/lib/synology-file-cache")
+	viper.SetDefault("cache.root_dir", "/data")
 	viper.SetDefault("cache.max_size_gb", 50)
 	viper.SetDefault("cache.max_disk_usage_percent", 50)
 	viper.SetDefault("cache.recent_modified_days", 30)
@@ -109,23 +150,6 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("database.path", "")
 	viper.SetDefault("database.cache_size_mb", 64)
 	viper.SetDefault("database.busy_timeout_ms", 5000)
-
-	// Read config file
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	var config Config
-	if err := viper.Unmarshal(&config); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
-	}
-
-	// Validate configuration
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
-	}
-
-	return &config, nil
 }
 
 // Validate validates the configuration
