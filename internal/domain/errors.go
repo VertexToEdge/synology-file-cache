@@ -14,6 +14,26 @@ var (
 	ErrShareExpired      = errors.New("share has expired")
 	ErrFileNotCached     = errors.New("file not cached")
 	ErrInsufficientSpace = errors.New("insufficient space")
+
+	// File domain errors
+	ErrFileTooLarge      = errors.New("file exceeds maximum cache size")
+	ErrFileAlreadyCached = errors.New("file is already cached")
+	ErrInvalidFileState  = errors.New("invalid file state")
+
+	// Share domain errors
+	ErrInvalidPassword = errors.New("invalid share password")
+	ErrShareNotFound   = errors.New("share not found")
+
+	// Download task domain errors
+	ErrTaskNotFound         = errors.New("download task not found")
+	ErrTaskAlreadyExists    = errors.New("download task already exists for this file")
+	ErrTaskAlreadyClaimed   = errors.New("task is already claimed by another worker")
+	ErrInvalidTaskState     = errors.New("invalid task state")
+	ErrInvalidStateTransition = errors.New("invalid state transition")
+
+	// Aggregate errors
+	ErrNilFile      = errors.New("file cannot be nil")
+	ErrNilAggregate = errors.New("aggregate cannot be nil")
 )
 
 // SkippableError represents an error that can be logged and skipped.
